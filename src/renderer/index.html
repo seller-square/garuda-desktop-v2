@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+  <head>
+    <meta
+    http-equiv="Content-Security-Policy"
+    content="
+      default-src 'self';
+      script-src 'self';
+      style-src 'self' 'unsafe-inline';
+      img-src 'self' data:;
+      connect-src
+        'self'
+        https://*.supabase.co
+        https://*.supabase.com
+        https://*.supabase.in
+        wss://*.supabase.co
+        wss://*.supabase.com;
+    "
+  />
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
