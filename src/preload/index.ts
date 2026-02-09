@@ -33,17 +33,25 @@ const api = {
     return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
   },
 
-  executeFilesystemStreamPlan: (
+  executeFilesystemStreamPlan: (request: {
+    accessToken: string
     items: Array<{
+      projectId: string
+      slotId: string
       sourcePath: string
+      sourceFilename: string
       destinationFilename: string
+      destinationPath: string
+      plannedSequence: number
+      sha256: string
+      sizeBytes: number
       projectCode: string
       slotCode: string
       assetKind: 'IMG' | 'VID' | 'OTHER'
       mimeType: string
     }>
-  ) => {
-    return electronAPI.ipcRenderer.invoke('execute-filesystem-stream-plan', items)
+  }) => {
+    return electronAPI.ipcRenderer.invoke('execute-filesystem-stream-plan', request)
   }
 }
 

@@ -73,6 +73,7 @@ type RenamePlanItem = {
 }
 
 type ExecutionPlanItem = {
+  projectId: string
   sourcePath: string
   sourceFilename: string
   destinationFilename: string
@@ -82,6 +83,7 @@ type ExecutionPlanItem = {
   slotCode: string
   assetKind: 'IMG' | 'VID' | 'OTHER'
   mimeType: string
+  plannedSequence: number
   sha256: string
   sizeBytes: number
 }
@@ -572,6 +574,7 @@ function App() {
     const projectCode = selectedProject.project_code?.trim() || 'PROJECT'
 
     return mappingPlan.renamePlan.map((item) => ({
+      projectId: selectedProject.id,
       sourcePath: item.sourcePath,
       sourceFilename: item.sourceFilename,
       destinationFilename: item.plannedFilename,
@@ -581,6 +584,7 @@ function App() {
       slotCode: item.slotCode,
       assetKind: item.fileType === 'image' ? 'IMG' : item.fileType === 'video' ? 'VID' : 'OTHER',
       mimeType: getMimeTypeFromExtension(getFileExtensionFromName(item.sourceFilename)),
+      plannedSequence: item.plannedSequence,
       sha256: item.sha256,
       sizeBytes: item.sizeBytes
     }))
@@ -978,7 +982,7 @@ function App() {
   }
 
   const handleExecuteDriveUpload = async () => {
-    if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject) {
+    if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject || !session) {
       return
     }
 
@@ -987,28 +991,36 @@ function App() {
 
     try {
       const projectCode = selectedProject.project_code?.trim() || 'PROJECT'
-      const response = await window.api.executeFilesystemStreamPlan(
-        executionPlan.map((item) => ({
+      const response = await window.api.executeFilesystemStreamPlan({
+        accessToken: session.access_token,
+        items: executionPlan.map((item) => ({
+          projectId: item.projectId,
+          slotId: item.slotId,
           sourcePath: item.sourcePath,
+          sourceFilename: item.sourceFilename,
           destinationFilename: item.destinationFilename,
+          destinationPath: item.destinationPath,
+          plannedSequence: item.plannedSequence,
+          sha256: item.sha256,
+          sizeBytes: item.sizeBytes,
           projectCode,
           slotCode: item.slotCode,
           assetKind: item.assetKind,
           mimeType: item.mimeType
         }))
-      )
+      })
 
       if (response.success) {
         setUploadResultMessage({
           kind: 'success',
-          text: `Streamed ${response.uploadedCount} file(s) to the Drive Desktop destination.`
+          text: `Uploaded ${response.uploadedCount} · skipped ${response.skippedCount} · failed ${response.failedCount}`
         })
         return
       }
 
       setUploadResultMessage({
         kind: 'error',
-        text: `Upload stopped after ${response.uploadedCount} file(s). Failed file: ${response.failedItem.destinationFilename}. ${response.error}`
+        text: `Uploaded ${response.uploadedCount} · skipped ${response.skippedCount} · failed ${response.failedCount}. Stopped on ${response.failedItem.destinationFilename}: ${response.error}`
       })
     } catch (error: unknown) {
       setUploadResultMessage({
@@ -1536,8 +1548,8 @@ function App() {
                 </button>
                 <button
                   onClick={handleExecuteDriveUpload}
-                  disabled={!executionValidation?.executionReady || uploadRunning}
-                  style={!executionValidation?.executionReady || uploadRunning ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                  disabled={!executionValidation?.executionReady || uploadRunning || !session}
+                  style={!executionValidation?.executionReady || uploadRunning || !session ? styles.actionButtonDisabled : styles.actionButtonSecondary}
                 >
                   {uploadRunning ? 'Streaming (Serial)...' : 'Execute Filesystem Stream'}
                 </button>

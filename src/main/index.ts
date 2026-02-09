@@ -5,6 +5,7 @@ import fs from 'fs'
 import path from 'path'
 import { pipeline } from 'stream/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { createClient } from '@supabase/supabase-js'
 import icon from '../../resources/icon.png?asset'
 
 type DetectedFileType = 'image' | 'video' | 'other'
@@ -72,8 +73,15 @@ type DryRunFileResult = {
 }
 
 type ExecutionUploadItem = {
+  projectId: string
+  slotId: string
   sourcePath: string
+  sourceFilename: string
   destinationFilename: string
+  destinationPath: string
+  plannedSequence: number
+  sha256: string
+  sizeBytes: number
   projectCode: string
   slotCode: string
   assetKind: 'IMG' | 'VID' | 'OTHER'
@@ -81,6 +89,17 @@ type ExecutionUploadItem = {
 }
 
 type UploadResultItem = {
+  projectId: string
+  slotId: string
+  sourcePath: string
+  destinationFilename: string
+  destinationPath: string
+  status: 'success' | 'failed' | 'skipped'
+  skippedReason: string | null
+  error: string | null
+}
+
+type StreamedFileWriteResult = {
   sourcePath: string
   destinationFilename: string
   destinationPath: string
@@ -90,15 +109,39 @@ type ExecuteUploadResult =
   | {
       success: true
       uploadedCount: number
+      skippedCount: number
+      failedCount: number
       results: UploadResultItem[]
+      executionResults: ExecutionResult[]
     }
   | {
       success: false
       uploadedCount: number
+      skippedCount: number
+      failedCount: number
       results: UploadResultItem[]
+      executionResults: ExecutionResult[]
       failedItem: ExecutionUploadItem
       error: string
     }
+
+type ExecutionRequest = {
+  accessToken: string
+  items: ExecutionUploadItem[]
+}
+
+type ExecutionResult = {
+  projectId: string
+  slotId: string
+  sourcePath: string
+  finalPath: string
+  plannedFilename: string
+  sha256: string
+  sizeBytes: number
+  plannedSequence: number
+  status: 'success' | 'failed' | 'skipped'
+  error?: string
+}
 
 const CONFIG_FILE_NAME = 'garuda-config.json'
 const HIDDEN_FOLDERS = new Set(['.git', 'node_modules'])
@@ -147,6 +190,23 @@ function getErrorMessage(error: unknown): string {
   }
 
   return String(error)
+}
+
+function getSupabaseExecutionClient(accessToken: string) {
+  const supabaseUrl = process.env.VITE_SUPABASE_URL
+  const supabaseAnonKey = process.env.VITE_SUPABASE_ANON_KEY
+
+  if (!supabaseUrl || !supabaseAnonKey) {
+    throw new Error('Missing Supabase environment variables in main process.')
+  }
+
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      }
+    }
+  })
 }
 
 function getConfigPath(): string {
@@ -258,7 +318,7 @@ class FilesystemStreamingAdapter {
     return path.join(this.driveRootPath, projectCode, 'source', assetKind, slotCode)
   }
 
-  async uploadStream(item: ExecutionUploadItem): Promise<UploadResultItem> {
+  async uploadStream(item: ExecutionUploadItem): Promise<StreamedFileWriteResult> {
     const destinationDir = this.resolveDestinationDir(item.projectCode, item.assetKind, item.slotCode)
     await fs.promises.mkdir(destinationDir, { recursive: true })
 
@@ -274,6 +334,74 @@ class FilesystemStreamingAdapter {
       destinationFilename: item.destinationFilename,
       destinationPath
     }
+  }
+}
+
+async function projectUploadExistsBySha256(
+  supabaseClient: ReturnType<typeof getSupabaseExecutionClient>,
+  projectId: string,
+  sha256: string
+): Promise<boolean> {
+  const { data, error } = await supabaseClient
+    .from('project_uploads')
+    .select('id')
+    .eq('project_id', projectId)
+    .eq('sha256', sha256)
+    .eq('is_source_file', true)
+    .limit(1)
+
+  if (error) {
+    throw error
+  }
+
+  return Array.isArray(data) && data.length > 0
+}
+
+async function insertProjectUploadSuccess(
+  supabaseClient: ReturnType<typeof getSupabaseExecutionClient>,
+  item: ExecutionUploadItem
+): Promise<void> {
+  const { error } = await supabaseClient.from('project_uploads').insert({
+    project_id: item.projectId,
+    slot_id: item.slotId,
+    upload_source: 'garuda',
+    is_source_file: true,
+    upload_stage: 'completed',
+    file_path: item.destinationPath,
+    original_filename: item.sourceFilename,
+    final_filename: item.destinationFilename,
+    sha256: item.sha256,
+    file_size: item.sizeBytes,
+    sequence_number: item.plannedSequence,
+    completed_at: new Date().toISOString()
+  })
+
+  if (error) {
+    throw error
+  }
+}
+
+async function updateSlotCurrentSequence(
+  supabaseClient: ReturnType<typeof getSupabaseExecutionClient>,
+  slotId: string,
+  nextSequence: number
+): Promise<void> {
+  const { data, error } = await supabaseClient.from('project_slots').select('current_sequence').eq('id', slotId).single()
+  if (error) {
+    throw error
+  }
+
+  const currentSequence =
+    data && typeof data.current_sequence === 'number' && Number.isFinite(data.current_sequence) ? data.current_sequence : 0
+
+  const targetSequence = Math.max(currentSequence, nextSequence)
+  const { error: updateError } = await supabaseClient
+    .from('project_slots')
+    .update({ current_sequence: targetSequence })
+    .eq('id', slotId)
+
+  if (updateError) {
+    throw updateError
   }
 }
 
@@ -606,29 +734,165 @@ app.whenReady().then(() => {
     }
   })
 
-  ipcMain.handle('execute-filesystem-stream-plan', async (_event, items: ExecutionUploadItem[]): Promise<ExecuteUploadResult> => {
+  ipcMain.handle('execute-filesystem-stream-plan', async (_event, payload: ExecutionRequest): Promise<ExecuteUploadResult> => {
+    const { accessToken, items } = payload
     const adapter = FilesystemStreamingAdapter.createFromLocalConfig()
+    const supabaseClient = getSupabaseExecutionClient(accessToken)
     const results: UploadResultItem[] = []
+    const executionResults: ExecutionResult[] = []
+
+    let uploadedCount = 0
+    let skippedCount = 0
+    let failedCount = 0
+
+    const slotTotals = new Map<string, number>()
+    const slotSucceeded = new Map<string, number>()
+    const slotFailed = new Set<string>()
+    const slotMaxInsertedSequence = new Map<string, number>()
+
+    for (const item of items) {
+      slotTotals.set(item.slotId, (slotTotals.get(item.slotId) ?? 0) + 1)
+    }
+
+    const finalizeSlotSequences = async () => {
+      for (const [slotId, total] of slotTotals.entries()) {
+        if (slotFailed.has(slotId)) {
+          continue
+        }
+
+        const succeeded = slotSucceeded.get(slotId) ?? 0
+        if (succeeded !== total) {
+          continue
+        }
+
+        const maxSequence = slotMaxInsertedSequence.get(slotId)
+        if (!maxSequence) {
+          continue
+        }
+
+        await updateSlotCurrentSequence(supabaseClient, slotId, maxSequence)
+      }
+    }
 
     for (const item of items) {
       try {
+        const alreadyExists = await projectUploadExistsBySha256(supabaseClient, item.projectId, item.sha256)
+        if (alreadyExists) {
+          skippedCount += 1
+          slotSucceeded.set(item.slotId, (slotSucceeded.get(item.slotId) ?? 0) + 1)
+          const skippedResult: UploadResultItem = {
+            projectId: item.projectId,
+            slotId: item.slotId,
+            sourcePath: item.sourcePath,
+            destinationFilename: item.destinationFilename,
+            destinationPath: item.destinationPath,
+            status: 'skipped',
+            skippedReason: 'sha256 already exists for this project',
+            error: null
+          }
+          results.push(skippedResult)
+          executionResults.push({
+            projectId: item.projectId,
+            slotId: item.slotId,
+            sourcePath: item.sourcePath,
+            finalPath: item.destinationPath,
+            plannedFilename: item.destinationFilename,
+            sha256: item.sha256,
+            sizeBytes: item.sizeBytes,
+            plannedSequence: item.plannedSequence,
+            status: 'skipped'
+          })
+          continue
+        }
+
         const uploaded = await adapter.uploadStream(item)
-        results.push(uploaded)
+        const destinationStats = await fs.promises.stat(uploaded.destinationPath)
+        if (destinationStats.size !== item.sizeBytes) {
+          throw new Error(
+            `Size mismatch after stream write. Expected ${item.sizeBytes} bytes, got ${destinationStats.size} bytes.`
+          )
+        }
+
+        await insertProjectUploadSuccess(supabaseClient, item)
+
+        uploadedCount += 1
+        slotSucceeded.set(item.slotId, (slotSucceeded.get(item.slotId) ?? 0) + 1)
+        const previousMax = slotMaxInsertedSequence.get(item.slotId) ?? 0
+        slotMaxInsertedSequence.set(item.slotId, Math.max(previousMax, item.plannedSequence))
+
+        results.push({
+          projectId: item.projectId,
+          slotId: item.slotId,
+          sourcePath: uploaded.sourcePath,
+          destinationFilename: uploaded.destinationFilename,
+          destinationPath: uploaded.destinationPath,
+          status: 'success',
+          skippedReason: null,
+          error: null
+        })
+        executionResults.push({
+          projectId: item.projectId,
+          slotId: item.slotId,
+          sourcePath: item.sourcePath,
+          finalPath: item.destinationPath,
+          plannedFilename: item.destinationFilename,
+          sha256: item.sha256,
+          sizeBytes: item.sizeBytes,
+          plannedSequence: item.plannedSequence,
+          status: 'success'
+        })
       } catch (error: unknown) {
+        failedCount += 1
+        slotFailed.add(item.slotId)
+        const message = getErrorMessage(error)
+
+        results.push({
+          projectId: item.projectId,
+          slotId: item.slotId,
+          sourcePath: item.sourcePath,
+          destinationFilename: item.destinationFilename,
+          destinationPath: item.destinationPath,
+          status: 'failed',
+          skippedReason: null,
+          error: message
+        })
+        executionResults.push({
+          projectId: item.projectId,
+          slotId: item.slotId,
+          sourcePath: item.sourcePath,
+          finalPath: item.destinationPath,
+          plannedFilename: item.destinationFilename,
+          sha256: item.sha256,
+          sizeBytes: item.sizeBytes,
+          plannedSequence: item.plannedSequence,
+          status: 'failed',
+          error: message
+        })
+
+        await finalizeSlotSequences()
+
         return {
           success: false,
-          uploadedCount: results.length,
+          uploadedCount,
+          skippedCount,
+          failedCount,
           results,
+          executionResults,
           failedItem: item,
-          error: getErrorMessage(error)
+          error: message
         }
       }
     }
 
+    await finalizeSlotSequences()
+
     return {
       success: true,
-      uploadedCount: results.length,
-      results
+      uploadedCount,
+      skippedCount,
+      failedCount,
+      results,
+      executionResults
     }
   })
 

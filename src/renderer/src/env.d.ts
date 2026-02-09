@@ -79,8 +79,15 @@ declare global {
   }
 
   type FilesystemExecutionUploadItem = {
+    projectId: string
+    slotId: string
     sourcePath: string
+    sourceFilename: string
     destinationFilename: string
+    destinationPath: string
+    plannedSequence: number
+    sha256: string
+    sizeBytes: number
     projectCode: string
     slotCode: string
     assetKind: 'IMG' | 'VID' | 'OTHER'
@@ -88,20 +95,53 @@ declare global {
   }
 
   type FilesystemUploadResultItem = {
+    projectId: string
+    slotId: string
     sourcePath: string
     destinationFilename: string
     destinationPath: string
+    status: 'success' | 'failed' | 'skipped'
+    skippedReason: string | null
+    error: string | null
+  }
+
+  type ExecutionResultItem = {
+    projectId: string
+    slotId: string
+    sourcePath: string
+    finalPath: string
+    plannedFilename: string
+    sha256: string
+    sizeBytes: number
+    plannedSequence: number
+    status: 'success' | 'failed' | 'skipped'
+    error?: string
   }
 
   type ExecuteFilesystemStreamResult =
-    | { success: true; uploadedCount: number; results: FilesystemUploadResultItem[] }
+    | {
+        success: true
+        uploadedCount: number
+        skippedCount: number
+        failedCount: number
+        results: FilesystemUploadResultItem[]
+        executionResults: ExecutionResultItem[]
+      }
     | {
         success: false
         uploadedCount: number
+        skippedCount: number
+        failedCount: number
         results: FilesystemUploadResultItem[]
+        executionResults: ExecutionResultItem[]
         failedItem: FilesystemExecutionUploadItem
         error: string
       }
+
+  type ExecuteFilesystemStreamRequest = {
+    accessToken: string
+    items: FilesystemExecutionUploadItem[]
+  }
 
   interface Window {
     api: {
@@ -112,7 +152,7 @@ declare global {
       validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
       setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
       dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
-      executeFilesystemStreamPlan: (items: FilesystemExecutionUploadItem[]) => Promise<ExecuteFilesystemStreamResult>
+      executeFilesystemStreamPlan: (request: ExecuteFilesystemStreamRequest) => Promise<ExecuteFilesystemStreamResult>
     }
   }
 }
