@@ -21,6 +21,7 @@ type DashboardTab = 'scan' | 'plan' | 'ingest' | 'settings'
 
 const PROJECT_LABEL_KEYS = ['display_name', 'name', 'project_name', 'title', 'project_code', 'code', 'slug']
 const PROJECT_CODE_KEYS = ['project_code', 'code', 'slug']
+const PROJECT_BRAND_KEYS = ['brand_name', 'name']
 const SLOT_LABEL_KEYS = ['slot_name', 'name', 'title', 'slot_code', 'code', 'label']
 const SLOT_SEQUENCE_KEYS = [
   'next_sequence_number',
@@ -68,6 +69,37 @@ function getProjectLabel(project: RowRecord): string {
 
 function getProjectCode(project: RowRecord): string | null {
   return pickFirstString(project, PROJECT_CODE_KEYS)
+}
+
+function getProjectBrandName(project: RowRecord): string | null {
+  const directBrandName = pickFirstString(project, PROJECT_BRAND_KEYS)
+  if (directBrandName) {
+    return directBrandName
+  }
+
+  const brandRelations = [project.brand, project.brands]
+
+  for (const relation of brandRelations) {
+    if (relation && typeof relation === 'object' && !Array.isArray(relation)) {
+      const nestedBrandName = pickFirstString(relation as RowRecord, PROJECT_BRAND_KEYS)
+      if (nestedBrandName) {
+        return nestedBrandName
+      }
+    }
+
+    if (Array.isArray(relation)) {
+      for (const item of relation) {
+        if (item && typeof item === 'object') {
+          const nestedBrandName = pickFirstString(item as RowRecord, PROJECT_BRAND_KEYS)
+          if (nestedBrandName) {
+            return nestedBrandName
+          }
+        }
+      }
+    }
+  }
+
+  return null
 }
 
 function getSlotLabel(slot: RowRecord): string {
@@ -157,7 +189,8 @@ function App() {
     return projects.filter((project) => {
       const label = getProjectLabel(project).toLowerCase()
       const code = (getProjectCode(project) ?? '').toLowerCase()
-      return label.includes(query) || code.includes(query)
+      const brand = (getProjectBrandName(project) ?? '').toLowerCase()
+      return label.includes(query) || code.includes(query) || brand.includes(query)
     })
   }, [projects, projectSearch])
 
@@ -165,7 +198,26 @@ function App() {
     setProjectsLoading(true)
     setProjectsError(null)
 
-    const { data, error } = await supabase.from('projects').select('*')
+    let data: RowRecord[] | null = null
+    let error: Error | null = null
+
+    const selectAttempts = [
+      '*, brands(brand_name, name)',
+      '*, brand:brands(brand_name, name)',
+      '*',
+    ]
+
+    for (const selectQuery of selectAttempts) {
+      const response = await supabase.from('projects').select(selectQuery)
+
+      if (!response.error) {
+        data = (response.data ?? []) as unknown as RowRecord[]
+        error = null
+        break
+      }
+
+      error = response.error
+    }
 
     if (error) {
       setProjectsError(error.message)
@@ -439,6 +491,7 @@ function App() {
                 const id = getId(project)
                 const selected = id === selectedProjectId
                 const code = getProjectCode(project)
+                const brandName = getProjectBrandName(project)
 
                 return (
                   <button
@@ -446,8 +499,8 @@ function App() {
                     style={selected ? styles.projectRowSelected : styles.projectRow}
                     onClick={() => setSelectedProjectId(id)}
                   >
-                    <span style={styles.projectTitle}>{getProjectLabel(project)}</span>
-                    {code && <span style={styles.projectSub}>{code}</span>}
+                    <span style={styles.projectTitle}>{code ?? getProjectLabel(project)}</span>
+                    <span style={styles.projectSub}>{brandName ?? '—'}</span>
                   </button>
                 )
               })
