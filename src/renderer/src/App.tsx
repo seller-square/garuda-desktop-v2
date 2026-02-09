@@ -7,6 +7,8 @@ import { supabase } from './lib/supabase'
 type ScannedFile = {
   name: string
   fullPath: string
+  absolutePath: string
+  filename: string
   relativePath: string
   parentRelativePath: string
   size: number
@@ -28,10 +30,13 @@ type FolderGroup = {
 
 type IngestionPlan = {
   rootFolder: string
+  root: string
   scannedAt: string
   totalFiles: number
   totalBytes: number
+  totalSize: number
   folderGroups: FolderGroup[]
+  folders: string[]
   files: ScannedFile[]
 }
 
@@ -260,26 +265,179 @@ const SLOT_CODE_PATTERN = /^[A-Za-z0-9_]+$/
 
 const EMPTY_INGESTION_PLAN: IngestionPlan = {
   rootFolder: '',
+  root: '',
   scannedAt: '',
   totalFiles: 0,
   totalBytes: 0,
+  totalSize: 0,
   folderGroups: [],
+  folders: [],
   files: []
 }
 
-function normalizeIngestionPlan(plan: Partial<IngestionPlan> | undefined): IngestionPlan {
-  if (!plan) {
+const IMAGE_EXTENSIONS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.tif',
+  '.tiff',
+  '.heic',
+  '.heif',
+  '.dng',
+  '.arw',
+  '.cr2',
+  '.cr3',
+  '.nef',
+  '.orf',
+  '.rw2'
+])
+const VIDEO_EXTENSIONS = new Set([
+  '.mp4',
+  '.mov',
+  '.mkv',
+  '.avi',
+  '.mxf',
+  '.mts',
+  '.m2ts',
+  '.r3d',
+  '.braw',
+  '.prores',
+  '.webm'
+])
+
+function detectFileType(extension: string): 'image' | 'video' | 'other' {
+  const normalized = extension.toLowerCase()
+  if (IMAGE_EXTENSIONS.has(normalized)) return 'image'
+  if (VIDEO_EXTENSIONS.has(normalized)) return 'video'
+  return 'other'
+}
+
+function normalizeIngestionPlan(plan: unknown): IngestionPlan {
+  if (!plan || typeof plan !== 'object') {
     return EMPTY_INGESTION_PLAN
   }
 
-  return {
-    rootFolder: typeof plan.rootFolder === 'string' ? plan.rootFolder : '',
-    scannedAt: typeof plan.scannedAt === 'string' ? plan.scannedAt : '',
-    totalFiles: typeof plan.totalFiles === 'number' ? plan.totalFiles : Array.isArray(plan.files) ? plan.files.length : 0,
-    totalBytes: typeof plan.totalBytes === 'number' ? plan.totalBytes : 0,
-    folderGroups: Array.isArray(plan.folderGroups) ? plan.folderGroups : [],
-    files: Array.isArray(plan.files) ? plan.files : []
+  const record = plan as Record<string, unknown>
+  const rawFiles = Array.isArray(record.files) ? (record.files as Array<Record<string, unknown>>) : []
+  const normalizedFiles: ScannedFile[] = rawFiles
+    .map((file) => {
+      const relativePath = typeof file.relativePath === 'string' ? file.relativePath : ''
+      const filename =
+        typeof file.filename === 'string'
+          ? file.filename
+          : typeof file.name === 'string'
+            ? file.name
+            : relativePath
+              ? pathBasename(relativePath)
+              : ''
+      const extension =
+        typeof file.extension === 'string'
+          ? file.extension
+          : filename.includes('.')
+            ? filename.slice(filename.lastIndexOf('.')).toLowerCase()
+            : ''
+      const absolutePath =
+        typeof file.absolutePath === 'string'
+          ? file.absolutePath
+          : typeof file.fullPath === 'string'
+            ? file.fullPath
+            : ''
+      const parentRelativePath =
+        typeof file.parentRelativePath === 'string'
+          ? file.parentRelativePath
+          : relativePath.includes('/')
+            ? relativePath.split('/').slice(0, -1).join('/') || '/'
+            : '/'
+      const size = typeof file.size === 'number' && Number.isFinite(file.size) ? file.size : 0
+      const fileType =
+        file.fileType === 'image' || file.fileType === 'video' || file.fileType === 'other'
+          ? file.fileType
+          : detectFileType(extension)
+
+      return {
+        name: filename,
+        filename,
+        fullPath: absolutePath,
+        absolutePath,
+        relativePath,
+        parentRelativePath,
+        size,
+        extension,
+        fileType,
+        sha256: typeof file.sha256 === 'string' ? file.sha256 : ''
+      }
+    })
+    .filter((file) => file.relativePath && file.fullPath)
+
+  const folderGroupsFromFiles = new Map<string, FolderGroup>()
+  for (const file of normalizedFiles) {
+    const key = file.parentRelativePath || '/'
+    const existing = folderGroupsFromFiles.get(key)
+    if (existing) {
+      existing.fileCount += 1
+      existing.totalBytes += file.size
+      existing.typeCounts[file.fileType] += 1
+      continue
+    }
+
+    folderGroupsFromFiles.set(key, {
+      relativePath: key,
+      fileCount: 1,
+      totalBytes: file.size,
+      typeCounts: {
+        image: file.fileType === 'image' ? 1 : 0,
+        video: file.fileType === 'video' ? 1 : 0,
+        other: file.fileType === 'other' ? 1 : 0
+      }
+    })
   }
+
+  const folderGroups = Array.from(folderGroupsFromFiles.values()).sort((a, b) => a.relativePath.localeCompare(b.relativePath))
+  const computedBytes = normalizedFiles.reduce((sum, file) => sum + file.size, 0)
+  const folders = Array.isArray(record.folders)
+    ? (record.folders as unknown[]).filter((folder): folder is string => typeof folder === 'string')
+    : folderGroups.map((group) => group.relativePath)
+  const rootFolder =
+    typeof record.rootFolder === 'string'
+      ? record.rootFolder
+      : typeof record.root === 'string'
+        ? record.root
+        : ''
+
+  return {
+    rootFolder,
+    root: rootFolder,
+    scannedAt: typeof record.scannedAt === 'string' ? record.scannedAt : new Date().toISOString(),
+    totalFiles:
+      typeof record.totalFiles === 'number' && Number.isFinite(record.totalFiles) ? record.totalFiles : normalizedFiles.length,
+    totalBytes:
+      typeof record.totalBytes === 'number' && Number.isFinite(record.totalBytes)
+        ? record.totalBytes
+        : typeof record.totalSize === 'number' && Number.isFinite(record.totalSize)
+          ? record.totalSize
+          : computedBytes,
+    totalSize:
+      typeof record.totalSize === 'number' && Number.isFinite(record.totalSize)
+        ? record.totalSize
+        : typeof record.totalBytes === 'number' && Number.isFinite(record.totalBytes)
+          ? record.totalBytes
+          : computedBytes,
+    folderGroups: Array.isArray(record.folderGroups) ? (record.folderGroups as FolderGroup[]) : folderGroups,
+    folders,
+    files: normalizedFiles
+  }
+}
+
+function pathBasename(relativePath: string): string {
+  const pieces = relativePath.split('/').filter(Boolean)
+  return pieces[pieces.length - 1] ?? relativePath
+}
+
+function normalizeLocalPath(candidatePath: string): string {
+  return candidatePath.trim().replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
 }
 
 function getId(row: RowRecord): string {
@@ -403,39 +561,6 @@ function getFileExtensionFromName(filename: string): string {
   return filename.slice(lastDotIndex).toLowerCase()
 }
 
-function buildSlotNameFromFolderPath(folderRelativePath: string): string {
-  if (folderRelativePath === '/') {
-    return 'ROOT'
-  }
-
-  const parts = folderRelativePath.split('/').filter(Boolean)
-  return parts[parts.length - 1] ?? 'NEW_SLOT'
-}
-
-async function createSlotForProject(projectId: string, slotLabel: string): Promise<string | null> {
-  const slotCode = normalizeSlotCode(slotLabel)
-  if (!slotCode) {
-    return null
-  }
-
-  const { data, error } = await supabase.rpc('create_project_slot', {
-    p_project_id: projectId,
-    p_slot_name: slotLabel,
-    p_slot_code: slotCode,
-    p_description: null,
-  })
-
-  if (error) {
-    throw error
-  }
-
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
-    return getId(data as RowRecord) || null
-  }
-
-  return null
-}
-
 function formatSupabaseError(error: unknown): string {
   if (typeof error === 'object' && error !== null) {
     const code = 'code' in error ? String(error.code) : null
@@ -543,23 +668,17 @@ function App() {
   const [vidBucketConfig, setVidBucketConfig] = useState<BucketWizardConfig>(defaultBucketConfig)
   const [vidMirrorImages, setVidMirrorImages] = useState(false)
   const [slotWizardLoading, setSlotWizardLoading] = useState(false)
-  const [showPreferences, setShowPreferences] = useState(false)
 
   const [activeTab, setActiveTab] = useState<DashboardTab>('scan')
 
   const [folderPath, setFolderPath] = useState<string | null>(null)
+  const [destinationPath, setDestinationPath] = useState<string | null>(null)
+  const [destinationPathWarning, setDestinationPathWarning] = useState<string | null>(null)
   const [scanResult, setScanResult] = useState<ScanResult>({ success: true, plan: EMPTY_INGESTION_PLAN })
   const [scanHasRun, setScanHasRun] = useState(false)
   const [scanning, setScanning] = useState(false)
-  const [driveRootPath, setDriveRootPath] = useState<string | null>(null)
-  const [driveRootInput, setDriveRootInput] = useState('')
-  const [driveRootLoading, setDriveRootLoading] = useState(false)
-  const [driveRootSaving, setDriveRootSaving] = useState(false)
-  const [driveRootMessage, setDriveRootMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
   const [folderSlotAssignments, setFolderSlotAssignments] = useState<Record<string, string>>({})
   const [slotNamingOverrides, setSlotNamingOverrides] = useState<Record<string, SlotNamingOverride>>({})
-  const [mappingMessage, setMappingMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
-  const [creatingSlotForFolder, setCreatingSlotForFolder] = useState<string | null>(null)
   const [executionRunning, setExecutionRunning] = useState(false)
   const [executionValidation, setExecutionValidation] = useState<ExecutionValidation | null>(null)
   const [uploadRunning, setUploadRunning] = useState(false)
@@ -963,7 +1082,7 @@ function App() {
       sourcePath: item.sourcePath,
       sourceFilename: item.sourceFilename,
       destinationFilename: item.plannedFilename,
-      destinationPath: `drive://${projectCode}/source/${item.fileType === 'image' ? 'IMG' : item.fileType === 'video' ? 'VID' : 'OTHER'}/${item.slotCode}/${item.plannedFilename}`,
+      destinationPath: `local://${projectCode}/source/${item.fileType === 'image' ? 'IMG' : item.fileType === 'video' ? 'VID' : 'OTHER'}/${item.slotCode}/${item.plannedFilename}`,
       slotId: item.slotId,
       slotLabel: item.slotLabel,
       slotCode: item.slotCode,
@@ -1190,12 +1309,6 @@ function App() {
     loadProjects().catch((error: unknown) => {
       setProjectsError(error instanceof Error ? error.message : 'Unknown error while fetching projects')
     })
-    loadDriveRootConfig().catch((error: unknown) => {
-      setDriveRootMessage({
-        kind: 'error',
-        text: error instanceof Error ? error.message : 'Unknown error while loading drive root',
-      })
-    })
   }, [session])
 
   useEffect(() => {
@@ -1221,6 +1334,11 @@ function App() {
       setShowSlotWizard(false)
       resetSlotWizard()
       setSlotActionMessage(null)
+      setFolderPath(null)
+      setDestinationPath(null)
+      setDestinationPathWarning(null)
+      setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
+      setScanHasRun(false)
       setSlots([])
       setSelectedSlotId(null)
       setFolderSlotAssignments({})
@@ -1238,6 +1356,11 @@ function App() {
     setShowSlotWizard(false)
     resetSlotWizard()
     setSlotActionMessage(null)
+    setFolderPath(null)
+    setDestinationPath(null)
+    setDestinationPathWarning(null)
+    setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
+    setScanHasRun(false)
     loadSlots(selectedProjectId).catch((error: unknown) => {
       setSlotsError(error instanceof Error ? error.message : 'Unknown error while fetching project slots')
     })
@@ -1246,11 +1369,12 @@ function App() {
   const handleSelectFolder = async () => {
     const path = await window.api.selectFolder()
     setFolderPath(path)
+    setDestinationPath(null)
+    setDestinationPathWarning(null)
     setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
     setScanHasRun(false)
     setFolderSlotAssignments({})
     setSlotNamingOverrides({})
-    setMappingMessage(null)
     setExecutionValidation(null)
     setUploadResultMessage(null)
     setExistingUploads([])
@@ -1263,11 +1387,12 @@ function App() {
   const handleScan = async () => {
     if (!folderPath) return
     setScanning(true)
+    setDestinationPath(null)
+    setDestinationPathWarning(null)
     setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
     setScanHasRun(false)
     setFolderSlotAssignments({})
     setSlotNamingOverrides({})
-    setMappingMessage(null)
     setExecutionValidation(null)
     setUploadResultMessage(null)
     setExistingUploads([])
@@ -1279,10 +1404,23 @@ function App() {
       const result = await window.api.scanFolder(folderPath)
       if (result && typeof result === 'object' && 'success' in result) {
         if (result.success) {
+          const normalizedPlan = normalizeIngestionPlan(result.plan)
           setScanResult({
             success: true,
-            plan: normalizeIngestionPlan(result.plan)
+            plan: normalizedPlan
           })
+
+          const selectedDestination = await window.api.selectFolder()
+          if (selectedDestination) {
+            if (normalizeLocalPath(folderPath) === normalizeLocalPath(selectedDestination)) {
+              setDestinationPath(null)
+              setDestinationPathWarning('Source and destination folders cannot be the same path.')
+            } else {
+              setDestinationPath(selectedDestination)
+            }
+          } else {
+            setDestinationPathWarning('Destination folder not selected yet.')
+          }
         } else {
           setScanResult({
             success: false,
@@ -1373,47 +1511,6 @@ function App() {
         padding
       }
     }))
-  }
-
-  const handleCreateSlotFromFolder = async (folderRelativePath: string) => {
-    if (!selectedProjectId) return
-
-    const slotLabel = buildSlotNameFromFolderPath(folderRelativePath)
-    setCreatingSlotForFolder(folderRelativePath)
-    setMappingMessage(null)
-    setSlotsError(null)
-
-    try {
-      const createdSlotId = await createSlotForProject(selectedProjectId, slotLabel)
-      if (!createdSlotId) {
-        setMappingMessage({
-          kind: 'error',
-          text: `Unable to create slot for folder "${folderRelativePath}".`
-        })
-        return
-      }
-
-      await loadSlots(selectedProjectId, { keepSelection: true })
-      setFolderSlotAssignments((current) => ({
-        ...current,
-        [folderRelativePath]: createdSlotId
-      }))
-      setMappingMessage({
-        kind: 'success',
-        text: `Created slot "${slotLabel}" and mapped folder "${folderRelativePath}".`
-      })
-    } catch (error: unknown) {
-      const maybeCode = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : null
-      const errorText =
-        maybeCode === '23505'
-          ? `Slot code for "${slotLabel}" already exists. Map this folder to an existing slot.`
-          : error instanceof Error
-            ? error.message
-            : 'Unable to create slot from folder'
-      setMappingMessage({ kind: 'error', text: errorText })
-    } finally {
-      setCreatingSlotForFolder(null)
-    }
   }
 
   const handleRunExecutionDryRun = async () => {
@@ -1669,7 +1766,7 @@ function App() {
     }
   }
 
-  const handleExecuteDriveUpload = async () => {
+  const handleExecuteUpload = async () => {
     if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject || !session) {
       return
     }
@@ -1742,100 +1839,18 @@ function App() {
     }
   }
 
-  const invokeDriveRootApi = async (methodName: string, channel: string, ...args: unknown[]) => {
-    const apiCandidate = (window as unknown as { api?: Record<string, unknown> }).api
-    const method = apiCandidate?.[methodName]
-    if (typeof method === 'function') {
-      return (method as (...methodArgs: unknown[]) => Promise<unknown>)(...args)
-    }
-
-    const electronApi = (window as unknown as { electron?: { ipcRenderer?: { invoke?: (...invokeArgs: unknown[]) => Promise<unknown> } } }).electron
-    const invoke = electronApi?.ipcRenderer?.invoke
-    if (typeof invoke === 'function') {
-      return invoke(channel, ...args)
-    }
-
-    throw new Error(`Drive root API unavailable (${methodName}).`)
-  }
-
-  const loadDriveRootConfig = async () => {
-    setDriveRootLoading(true)
-    setDriveRootMessage(null)
-
-    try {
-      const config = (await invokeDriveRootApi('getDriveRootPath', 'get-drive-root-path')) as {
-        driveRootPath: string | null
-      }
-      const savedPath = config.driveRootPath
-      setDriveRootPath(savedPath)
-      setDriveRootInput(savedPath ?? '')
-    } catch (error: unknown) {
-      const errorText = error instanceof Error ? error.message : 'Failed to load drive root path'
-      setDriveRootMessage({ kind: 'error', text: errorText })
-    } finally {
-      setDriveRootLoading(false)
-    }
-  }
-
-  const handlePickDriveRoot = async () => {
+  const handleSelectDestinationFolder = async () => {
     const selectedPath = await window.api.selectFolder()
     if (!selectedPath) return
 
-    setDriveRootInput(selectedPath)
-    const validation = (await invokeDriveRootApi('validateDriveRootPath', 'validate-drive-root-path', selectedPath)) as {
-      valid: boolean
-      normalizedPath: string | null
-      error: string | null
-    }
-
-    if (validation.valid && validation.normalizedPath) {
-      setDriveRootMessage({ kind: 'success', text: 'Path looks valid. Save to persist it.' })
-    } else {
-      setDriveRootMessage({ kind: 'error', text: validation.error ?? 'Invalid drive root path.' })
-    }
-  }
-
-  const handleValidateDriveRoot = async () => {
-    const validation = (await invokeDriveRootApi('validateDriveRootPath', 'validate-drive-root-path', driveRootInput || null)) as {
-      valid: boolean
-      normalizedPath: string | null
-      error: string | null
-    }
-    if (validation.valid && validation.normalizedPath) {
-      setDriveRootMessage({ kind: 'success', text: `Valid path: ${validation.normalizedPath}` })
+    setDestinationPath(selectedPath)
+    if (folderPath && normalizeLocalPath(folderPath) === normalizeLocalPath(selectedPath)) {
+      setDestinationPath(null)
+      setDestinationPathWarning('Source and destination folders cannot be the same path.')
       return
     }
 
-    setDriveRootMessage({ kind: 'error', text: validation.error ?? 'Invalid drive root path.' })
-  }
-
-  const handleSaveDriveRoot = async () => {
-    setDriveRootSaving(true)
-    setDriveRootMessage(null)
-
-    try {
-      const result = (await invokeDriveRootApi('setDriveRootPath', 'set-drive-root-path', driveRootInput || null)) as {
-        success: boolean
-        driveRootPath: string | null
-        error: string | null
-      }
-      if (!result.success) {
-        setDriveRootMessage({ kind: 'error', text: result.error ?? 'Failed to save drive root path.' })
-        return
-      }
-
-      setDriveRootPath(result.driveRootPath)
-      setDriveRootInput(result.driveRootPath ?? '')
-      setDriveRootMessage({
-        kind: 'success',
-        text: result.driveRootPath ? 'Drive root path saved.' : 'Drive root path cleared.',
-      })
-    } catch (error: unknown) {
-      const errorText = error instanceof Error ? error.message : 'Failed to save drive root path'
-      setDriveRootMessage({ kind: 'error', text: errorText })
-    } finally {
-      setDriveRootSaving(false)
-    }
+    setDestinationPathWarning(null)
   }
 
   if (loading) {
@@ -1938,21 +1953,6 @@ function App() {
         </div>
 
         <div style={styles.footer}>
-          <button
-            onClick={() => {
-              setShowPreferences(true)
-              setDriveRootMessage(null)
-              loadDriveRootConfig().catch((error: unknown) => {
-                setDriveRootMessage({
-                  kind: 'error',
-                  text: error instanceof Error ? error.message : 'Failed to load preferences.'
-                })
-              })
-            }}
-            style={styles.preferencesButton}
-          >
-            Preferences
-          </button>
           <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 12 }}>{session.user.email}</div>
           <button onClick={() => supabase.auth.signOut()} style={styles.signOutButton}>
             <LogOut size={14} /> Sign Out
@@ -1993,6 +1993,14 @@ function App() {
           <div style={styles.errorBanner}>
             {projectsError && <div>Projects: {projectsError}</div>}
             {slotsError && <div>Slots: {slotsError}</div>}
+          </div>
+        )}
+
+        {selectedProjectId && slotsConfigured && !showSlotWizard && (
+          <div style={styles.slotWizardLaunchRow}>
+            <button onClick={openSlotWizard} disabled={slotWizardLoading} style={styles.actionButtonSecondary}>
+              <Plus size={14} /> Add More Slots
+            </button>
           </div>
         )}
 
@@ -2445,6 +2453,22 @@ function App() {
               </div>
 
               {folderPath && <div style={styles.pathText}>Selected: {folderPath}</div>}
+              {destinationPath && <div style={styles.pathText}>Destination: {destinationPath}</div>}
+              {!destinationPath && scanHasRun && scanResult.success && (
+                <div style={styles.mutedPanel}>Select a destination folder for the next execution phase.</div>
+              )}
+
+              <div style={{ display: 'flex', gap: 12, marginBottom: 12 }}>
+                <button
+                  onClick={handleSelectDestinationFolder}
+                  disabled={!scanHasRun || !scanResult.success}
+                  style={!scanHasRun || !scanResult.success ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                >
+                  <FolderOpen size={16} /> Select Destination
+                </button>
+              </div>
+
+              {destinationPathWarning && <div style={styles.errorBanner}>{destinationPathWarning}</div>}
 
               {!scanHasRun && (
                 <div style={styles.mutedPanel}>No scan yet. Select a folder and run scan.</div>
@@ -2493,7 +2517,6 @@ function App() {
                     <span>Folder Group</span>
                     <span>Files</span>
                     <span>Assign Slot</span>
-                    <span>Create Slot</span>
                   </div>
 
                   <div style={styles.mappingGridBody}>
@@ -2516,22 +2539,9 @@ function App() {
                             </option>
                           ))}
                         </select>
-                        <button
-                          onClick={() => handleCreateSlotFromFolder(group.relativePath)}
-                          disabled={!selectedProjectId || creatingSlotForFolder === group.relativePath}
-                          style={styles.mappingCreateButton}
-                        >
-                          {creatingSlotForFolder === group.relativePath ? 'Creating...' : 'From Folder'}
-                        </button>
                       </div>
                     ))}
                   </div>
-
-                  {mappingMessage && (
-                    <div style={mappingMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
-                      {mappingMessage.text}
-                    </div>
-                  )}
 
                   {mappingPlan && (
                     <div style={styles.mappingSummaryPanel}>
@@ -2699,7 +2709,7 @@ function App() {
                   {preflightLoading ? 'Preflight...' : 'Run Resume Preflight'}
                 </button>
                 <button
-                  onClick={handleExecuteDriveUpload}
+                  onClick={handleExecuteUpload}
                   disabled={
                     !executionValidation?.executionReady ||
                     uploadRunning ||
@@ -2826,59 +2836,6 @@ function App() {
 
         </section>
       </main>
-      {showPreferences && (
-        <div style={styles.preferencesOverlay}>
-          <div style={styles.preferencesModal}>
-            <div style={styles.preferencesHeader}>
-              <div>
-                <h3 style={styles.todoHeading}>Preferences</h3>
-                <p style={styles.todoText}>Global settings for this desktop machine.</p>
-              </div>
-              <button onClick={() => setShowPreferences(false)} style={styles.actionButtonSecondary}>
-                Close
-              </button>
-            </div>
-
-            <div style={styles.settingsBlock}>
-              <h4 style={styles.mappingSummaryTitle}>Google Drive Root Path</h4>
-              <p style={styles.slotDialogText}>
-                This is the local Google Drive stream folder used for ingestion. It is stored in local app config.
-              </p>
-              <label style={styles.settingsLabel}>Saved Path</label>
-              <div style={styles.savedPathBox}>{driveRootPath ?? 'Not configured'}</div>
-            </div>
-
-            <div style={styles.settingsBlock}>
-              <label style={styles.settingsLabel}>Drive Root</label>
-              <div style={styles.settingsInputRow}>
-                <input
-                  value={driveRootInput}
-                  onChange={(event) => setDriveRootInput(event.target.value)}
-                  placeholder="/Users/you/Library/CloudStorage/GoogleDrive-..."
-                  style={styles.settingsInput}
-                />
-                <button onClick={handlePickDriveRoot} style={styles.actionButtonSecondary}>
-                  <FolderOpen size={16} /> Browse
-                </button>
-              </div>
-              <div style={styles.settingsButtonRow}>
-                <button onClick={handleValidateDriveRoot} style={styles.actionButtonSecondary} disabled={driveRootLoading}>
-                  Validate
-                </button>
-                <button onClick={handleSaveDriveRoot} style={styles.actionButtonPrimary} disabled={driveRootSaving}>
-                  {driveRootSaving ? 'Saving...' : 'Save'}
-                </button>
-              </div>
-            </div>
-
-            {driveRootMessage && (
-              <div style={driveRootMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
-                {driveRootMessage.text}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -3194,21 +3151,6 @@ const styles: Record<string, React.CSSProperties> = {
     borderTop: '1px solid #1e293b',
     paddingTop: 16,
   },
-  preferencesButton: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    border: '1px solid #334155',
-    background: '#0f172a',
-    color: '#cbd5e1',
-    borderRadius: 8,
-    padding: '8px 10px',
-    cursor: 'pointer',
-    marginBottom: 10,
-    width: '100%',
-    fontSize: 13,
-    fontWeight: 600
-  },
   signOutButton: {
     display: 'flex',
     alignItems: 'center',
@@ -3282,6 +3224,11 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 8,
     marginBottom: 10,
     fontSize: 12,
+  },
+  slotWizardLaunchRow: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    marginBottom: 10
   },
   tabBar: {
     display: 'flex',
@@ -3455,7 +3402,7 @@ const styles: Record<string, React.CSSProperties> = {
   mappingGridHeader: {
     marginTop: 16,
     display: 'grid',
-    gridTemplateColumns: '2fr 1.3fr 1.4fr 120px',
+    gridTemplateColumns: '2fr 1.3fr 1.4fr',
     gap: 10,
     color: '#94a3b8',
     fontSize: 12,
@@ -3472,7 +3419,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   mappingGridRow: {
     display: 'grid',
-    gridTemplateColumns: '2fr 1.3fr 1.4fr 120px',
+    gridTemplateColumns: '2fr 1.3fr 1.4fr',
     gap: 10,
     alignItems: 'center',
     borderBottom: '1px solid #1e293b',
@@ -3494,16 +3441,6 @@ const styles: Record<string, React.CSSProperties> = {
     color: 'white',
     fontSize: 12,
     padding: '8px 10px'
-  },
-  mappingCreateButton: {
-    border: 'none',
-    borderRadius: 8,
-    background: '#2563eb',
-    color: 'white',
-    fontSize: 12,
-    fontWeight: 600,
-    padding: '8px 10px',
-    cursor: 'pointer'
   },
   mappingSummaryPanel: {
     marginTop: 16,
@@ -3649,68 +3586,11 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#94a3b8',
     fontSize: 14,
   },
-  settingsBlock: {
-    marginTop: 16,
-  },
   settingsLabel: {
     display: 'block',
     fontSize: 12,
     color: '#94a3b8',
     marginBottom: 8,
-  },
-  savedPathBox: {
-    background: '#0f172a',
-    border: '1px solid #1e293b',
-    borderRadius: 8,
-    padding: '10px 12px',
-    fontSize: 13,
-    color: '#cbd5e1',
-    minHeight: 18,
-    wordBreak: 'break-all',
-  },
-  settingsInputRow: {
-    display: 'flex',
-    gap: 10,
-  },
-  settingsInput: {
-    flex: 1,
-    borderRadius: 8,
-    border: '1px solid #334155',
-    background: '#0f172a',
-    color: 'white',
-    fontSize: 13,
-    padding: '10px 12px',
-    outline: 'none',
-  },
-  settingsButtonRow: {
-    display: 'flex',
-    gap: 10,
-    marginTop: 10,
-  },
-  preferencesOverlay: {
-    position: 'fixed',
-    inset: 0,
-    background: 'rgba(2, 6, 23, 0.72)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 1000,
-    padding: 24
-  },
-  preferencesModal: {
-    width: '100%',
-    maxWidth: 900,
-    border: '1px solid #1e293b',
-    borderRadius: 12,
-    background: '#0b1220',
-    padding: 20
-  },
-  preferencesHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    gap: 12,
-    marginBottom: 14
   },
 }
 

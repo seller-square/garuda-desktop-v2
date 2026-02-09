@@ -11,39 +11,29 @@ import icon from '../../resources/icon.png?asset'
 type DetectedFileType = 'image' | 'video' | 'other'
 
 type PlannedFile = {
+  absolutePath: string
+  filename: string
   name: string
   fullPath: string
-  relativePath: string
   parentRelativePath: string
-  size: number
-  extension: string
   fileType: DetectedFileType
   sha256: string
-}
-
-type FolderGroup = {
   relativePath: string
-  fileCount: number
-  totalBytes: number
-  typeCounts: {
-    image: number
-    video: number
-    other: number
-  }
+  size: number
+  extension: string
 }
 
 type IngestionPlan = {
-  rootFolder: string
-  scannedAt: string
+  root: string
   totalFiles: number
-  totalBytes: number
-  folderGroups: FolderGroup[]
+  totalSize: number
+  folders: string[]
   files: PlannedFile[]
 }
 
 type ScanResult =
   | { success: true; plan: IngestionPlan }
-  | { success: false; error: string }
+  | { success: false; error: string; plan: IngestionPlan }
 
 type DriveRootConfig = {
   driveRootPath: string | null
@@ -247,12 +237,6 @@ function readDriveRootConfig(): DriveRootConfig {
   }
 }
 
-function writeDriveRootConfig(config: DriveRootConfig): void {
-  const configPath = getConfigPath()
-  fs.mkdirSync(path.dirname(configPath), { recursive: true })
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8')
-}
-
 function validateDriveRootPath(candidatePath: string | null): DrivePathValidation {
   if (!candidatePath || candidatePath.trim().length === 0) {
     return { valid: false, normalizedPath: null, error: 'Drive root path is required.' }
@@ -435,7 +419,7 @@ function shouldIgnoreDirectory(name: string): boolean {
 }
 
 function shouldIgnoreFile(name: string): boolean {
-  return name === '.DS_Store'
+  return name === '.DS_Store' || name.startsWith('.')
 }
 
 function detectFileType(extension: string): DetectedFileType {
@@ -480,92 +464,92 @@ async function collectFilesRecursive(
   rootFolder: string,
   currentFolder: string,
   control: ScanControl,
-  collector: PlannedFile[]
+  collector: PlannedFile[],
+  folders: Set<string>
 ): Promise<void> {
   ensureNotCancelled(control)
 
-  const entries = await fs.promises.readdir(currentFolder, { withFileTypes: true })
+  let entries: fs.Dirent[]
+  try {
+    entries = await fs.promises.readdir(currentFolder, { withFileTypes: true })
+  } catch {
+    return
+  }
 
   for (const entry of entries) {
     ensureNotCancelled(control)
 
-    if (entry.isDirectory()) {
-      if (shouldIgnoreDirectory(entry.name)) {
-        continue
-      }
-
-      const nestedPath = path.join(currentFolder, entry.name)
-      await collectFilesRecursive(rootFolder, nestedPath, control, collector)
-      continue
-    }
-
-    if (!entry.isFile()) {
-      continue
-    }
-
-    if (shouldIgnoreFile(entry.name)) {
+    if (shouldIgnoreDirectory(entry.name)) {
       continue
     }
 
     const fullPath = path.join(currentFolder, entry.name)
-    const relativePath = path.relative(rootFolder, fullPath)
-    const parentRelativeRaw = path.dirname(relativePath)
-    const parentRelativePath = parentRelativeRaw === '.' ? '/' : parentRelativeRaw
-    const extension = path.extname(entry.name).toLowerCase()
 
-    const stats = await fs.promises.stat(fullPath)
-    const sha256 = await hashFileSha256(fullPath, control)
+    try {
+      const stats = entry.isSymbolicLink() ? await fs.promises.stat(fullPath) : null
+      const isDirectory = entry.isDirectory() || (entry.isSymbolicLink() && Boolean(stats?.isDirectory()))
+      const isFile = entry.isFile() || (entry.isSymbolicLink() && Boolean(stats?.isFile()))
 
-    collector.push({
-      name: entry.name,
-      fullPath,
-      relativePath,
-      parentRelativePath,
-      size: stats.size,
-      extension,
-      fileType: detectFileType(extension),
-      sha256
-    })
+      if (isDirectory) {
+        const relativeFolder = path.relative(rootFolder, fullPath).replace(/\\/g, '/')
+        folders.add(relativeFolder === '' ? '/' : relativeFolder)
+        await collectFilesRecursive(rootFolder, fullPath, control, collector, folders)
+        continue
+      }
+
+      if (!isFile || shouldIgnoreFile(entry.name)) {
+        continue
+      }
+
+      const relativePath = path.relative(rootFolder, fullPath).replace(/\\/g, '/')
+      const parentRelativeRaw = path.dirname(relativePath).replace(/\\/g, '/')
+      const parentRelativePath = parentRelativeRaw === '.' ? '/' : parentRelativeRaw
+      const extension = path.extname(entry.name).toLowerCase()
+      const fileStats = stats ?? (await fs.promises.stat(fullPath))
+      const sha256 = await hashFileSha256(fullPath, control)
+
+      collector.push({
+        absolutePath: fullPath,
+        fullPath,
+        name: entry.name,
+        filename: entry.name,
+        relativePath,
+        parentRelativePath,
+        size: fileStats.size,
+        extension,
+        fileType: detectFileType(extension),
+        sha256
+      })
+    } catch {
+      continue
+    }
+  }
+}
+
+function emptyIngestionPlan(rootFolder: string): IngestionPlan {
+  return {
+    root: rootFolder,
+    totalFiles: 0,
+    totalSize: 0,
+    folders: [],
+    files: []
   }
 }
 
 async function buildIngestionPlan(rootFolder: string, control: ScanControl): Promise<IngestionPlan> {
   const files: PlannedFile[] = []
-  await collectFilesRecursive(rootFolder, rootFolder, control, files)
+  const folders = new Set<string>()
+  await collectFilesRecursive(rootFolder, rootFolder, control, files, folders)
   ensureNotCancelled(control)
 
-  const groupsMap = new Map<string, FolderGroup>()
-
-  for (const file of files) {
-    const existing = groupsMap.get(file.parentRelativePath)
-    if (existing) {
-      existing.fileCount += 1
-      existing.totalBytes += file.size
-      existing.typeCounts[file.fileType] += 1
-      continue
-    }
-
-    groupsMap.set(file.parentRelativePath, {
-      relativePath: file.parentRelativePath,
-      fileCount: 1,
-      totalBytes: file.size,
-      typeCounts: {
-        image: file.fileType === 'image' ? 1 : 0,
-        video: file.fileType === 'video' ? 1 : 0,
-        other: file.fileType === 'other' ? 1 : 0
-      }
-    })
-  }
-
-  const folderGroups = Array.from(groupsMap.values()).sort((a, b) => a.relativePath.localeCompare(b.relativePath))
-  const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
+  const totalSize = files.reduce((sum, file) => sum + file.size, 0)
+  const normalizedFolders = Array.from(folders.values()).sort((a, b) => a.localeCompare(b))
 
   return {
-    rootFolder,
-    scannedAt: new Date().toISOString(),
+    root: rootFolder,
     totalFiles: files.length,
-    totalBytes,
-    folderGroups,
+    totalSize,
+    folders: normalizedFolders,
     files
   }
 }
@@ -641,7 +625,8 @@ app.whenReady().then(() => {
     } catch (error: unknown) {
       const result: ScanResult = {
         success: false,
-        error: getErrorMessage(error)
+        error: getErrorMessage(error),
+        plan: emptyIngestionPlan(folderPath)
       }
       return result
     } finally {
@@ -657,34 +642,6 @@ app.whenReady().then(() => {
     }
 
     return { success: true }
-  })
-
-  ipcMain.handle('get-drive-root-path', async () => {
-    const config = readDriveRootConfig()
-    return config
-  })
-
-  ipcMain.handle('validate-drive-root-path', async (_event, candidatePath: string | null) => {
-    return validateDriveRootPath(candidatePath)
-  })
-
-  ipcMain.handle('set-drive-root-path', async (_event, candidatePath: string | null) => {
-    if (candidatePath === null || candidatePath.trim() === '') {
-      writeDriveRootConfig({ driveRootPath: null, updatedAt: new Date().toISOString() })
-      return { success: true, driveRootPath: null, error: null }
-    }
-
-    const validation = validateDriveRootPath(candidatePath)
-    if (!validation.valid || !validation.normalizedPath) {
-      return { success: false, driveRootPath: null, error: validation.error ?? 'Invalid path.' }
-    }
-
-    writeDriveRootConfig({
-      driveRootPath: validation.normalizedPath,
-      updatedAt: new Date().toISOString()
-    })
-
-    return { success: true, driveRootPath: validation.normalizedPath, error: null }
   })
 
   ipcMain.handle('dry-run-stream-open', async (_event, items: DryRunRequestItem[]) => {

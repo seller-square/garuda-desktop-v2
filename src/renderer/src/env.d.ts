@@ -3,59 +3,25 @@
 export {}
 
 declare global {
-  type DetectedFileType = 'image' | 'video' | 'other'
-
   type ScannedFile = {
-    name: string
-    fullPath: string
+    absolutePath: string
     relativePath: string
-    parentRelativePath: string
-    size: number
+    filename: string
     extension: string
-    fileType: DetectedFileType
-    sha256: string
-  }
-
-  type FolderGroup = {
-    relativePath: string
-    fileCount: number
-    totalBytes: number
-    typeCounts: {
-      image: number
-      video: number
-      other: number
-    }
+    size: number
   }
 
   type IngestionPlan = {
-    rootFolder: string
-    scannedAt: string
+    root: string
     totalFiles: number
-    totalBytes: number
-    folderGroups: FolderGroup[]
+    totalSize: number
     files: ScannedFile[]
+    folders: string[]
   }
 
   type ScanResult =
     | { success: true; plan: IngestionPlan }
-    | { success: false; error: string }
-
-  type DriveRootConfig = {
-    driveRootPath: string | null
-    updatedAt: string | null
-  }
-
-  type DrivePathValidation = {
-    valid: boolean
-    normalizedPath: string | null
-    error: string | null
-  }
-
-  type SaveDriveRootResult = {
-    success: boolean
-    driveRootPath: string | null
-    error: string | null
-  }
+    | { success: false; error: string; plan: IngestionPlan }
 
   type DryRunRequestItem = {
     sourcePath: string
@@ -169,9 +135,6 @@ declare global {
       selectFolder: () => Promise<string | null>
       scanFolder: (folderPath: string) => Promise<ScanResult>
       cancelScanFolder: () => Promise<{ success: boolean }>
-      getDriveRootPath: () => Promise<DriveRootConfig>
-      validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
-      setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
       dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
       verifyDestinationPaths: (items: VerifyDestinationRequestItem[]) => Promise<VerifyDestinationResult>
       executeFilesystemStreamPlan: (request: ExecuteFilesystemStreamRequest) => Promise<ExecuteFilesystemStreamResult>

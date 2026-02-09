@@ -17,18 +17,6 @@ const api = {
     return electronAPI.ipcRenderer.invoke('cancel-scan-folder')
   },
 
-  getDriveRootPath: () => {
-    return electronAPI.ipcRenderer.invoke('get-drive-root-path')
-  },
-
-  validateDriveRootPath: (candidatePath: string | null) => {
-    return electronAPI.ipcRenderer.invoke('validate-drive-root-path', candidatePath)
-  },
-
-  setDriveRootPath: (candidatePath: string | null) => {
-    return electronAPI.ipcRenderer.invoke('set-drive-root-path', candidatePath)
-  },
-
   dryRunStreamOpen: (items: Array<{ sourcePath: string; expectedSizeBytes: number }>) => {
     return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
   },
