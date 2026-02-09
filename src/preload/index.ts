@@ -13,6 +13,10 @@ const api = {
     return electronAPI.ipcRenderer.invoke('scan-folder', folderPath)
   },
 
+  cancelScanFolder: () => {
+    return electronAPI.ipcRenderer.invoke('cancel-scan-folder')
+  },
+
   getDriveRootPath: () => {
     return electronAPI.ipcRenderer.invoke('get-drive-root-path')
   },

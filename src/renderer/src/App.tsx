@@ -6,13 +6,37 @@ import { supabase } from './lib/supabase'
 
 type ScannedFile = {
   name: string
-  path: string
+  fullPath: string
+  relativePath: string
+  parentRelativePath: string
   size: number
   extension: string
+  fileType: 'image' | 'video' | 'other'
+  sha256: string
+}
+
+type FolderGroup = {
+  relativePath: string
+  fileCount: number
+  totalBytes: number
+  typeCounts: {
+    image: number
+    video: number
+    other: number
+  }
+}
+
+type IngestionPlan = {
+  rootFolder: string
+  scannedAt: string
+  totalFiles: number
+  totalBytes: number
+  folderGroups: FolderGroup[]
+  files: ScannedFile[]
 }
 
 type ScanResult =
-  | { success: true; count: number; files: ScannedFile[] }
+  | { success: true; plan: IngestionPlan }
   | { success: false; error: string }
 
 type RowRecord = Record<string, unknown>
@@ -80,6 +104,13 @@ function getSlotLabel(slot: RowRecord): string {
 
 function getSlotSequence(slot: RowRecord): number | null {
   return pickFirstNumber(slot, SLOT_SEQUENCE_KEYS)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
 function normalizeSlotCode(rawLabel: string): string {
@@ -335,9 +366,14 @@ function App() {
   const handleScan = async () => {
     if (!folderPath) return
     setScanning(true)
+    setScanResult(null)
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
     setScanning(false)
+  }
+
+  const handleCancelScan = async () => {
+    await window.api.cancelScanFolder()
   }
 
   const loadDriveRootConfig = async () => {
@@ -605,19 +641,32 @@ function App() {
                   {scanning ? <Loader2 size={16} /> : <Scan size={16} />}
                   {scanning ? 'Scanning...' : 'Scan Folder'}
                 </button>
+
+                {scanning && (
+                  <button onClick={handleCancelScan} style={styles.actionButtonDanger}>
+                    Abort Scan
+                  </button>
+                )}
               </div>
 
               {folderPath && <div style={styles.pathText}>Selected: {folderPath}</div>}
 
               {scanResult && scanResult.success && (
                 <div style={styles.resultPanel}>
-                  <strong>{scanResult.count} files found</strong>
-                  <div style={{ marginTop: 10, maxHeight: 260, overflowY: 'auto' }}>
-                    {scanResult.files.slice(0, 25).map((file, index) => (
-                      <div key={`${file.path}-${index}`} style={styles.fileRow}>
-                        <span>{file.name}</span>
+                  <strong>{scanResult.plan.totalFiles} files found</strong>
+                  <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 6 }}>
+                    Root: {scanResult.plan.rootFolder}
+                  </div>
+                  <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4 }}>
+                    Total size: {formatBytes(scanResult.plan.totalBytes)} · Folders: {scanResult.plan.folderGroups.length}
+                  </div>
+                  <div style={{ marginTop: 12, maxHeight: 300, overflowY: 'auto' }}>
+                    {scanResult.plan.folderGroups.map((group) => (
+                      <div key={group.relativePath} style={styles.fileRow}>
+                        <span>{group.relativePath}</span>
                         <span style={{ color: '#64748b' }}>
-                          {(file.size / 1024 / 1024).toFixed(2)} MB · {file.extension}
+                          {group.fileCount} files · img {group.typeCounts.image} · vid {group.typeCounts.video} · other{' '}
+                          {group.typeCounts.other}
                         </span>
                       </div>
                     ))}
@@ -1003,6 +1052,17 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#334155',
     color: 'white',
     cursor: 'not-allowed',
+  },
+  actionButtonDanger: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '10px 14px',
+    borderRadius: 8,
+    border: 'none',
+    background: '#dc2626',
+    color: 'white',
+    cursor: 'pointer',
   },
   pathText: {
     fontSize: 13,

@@ -1,19 +1,46 @@
 import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
 import { join } from 'path'
+import { createHash } from 'crypto'
 import fs from 'fs'
 import path from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 
-type ScannedFile = {
+type DetectedFileType = 'image' | 'video' | 'other'
+
+type PlannedFile = {
   name: string
-  path: string
+  fullPath: string
+  relativePath: string
+  parentRelativePath: string
   size: number
   extension: string
+  fileType: DetectedFileType
+  sha256: string
+}
+
+type FolderGroup = {
+  relativePath: string
+  fileCount: number
+  totalBytes: number
+  typeCounts: {
+    image: number
+    video: number
+    other: number
+  }
+}
+
+type IngestionPlan = {
+  rootFolder: string
+  scannedAt: string
+  totalFiles: number
+  totalBytes: number
+  folderGroups: FolderGroup[]
+  files: PlannedFile[]
 }
 
 type ScanResult =
-  | { success: true; count: number; files: ScannedFile[] }
+  | { success: true; plan: IngestionPlan }
   | { success: false; error: string }
 
 type DriveRootConfig = {
@@ -28,6 +55,45 @@ type DrivePathValidation = {
 }
 
 const CONFIG_FILE_NAME = 'garuda-config.json'
+const HIDDEN_FOLDERS = new Set(['.git', 'node_modules'])
+const IMAGE_EXTENSIONS = new Set([
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.webp',
+  '.bmp',
+  '.tif',
+  '.tiff',
+  '.heic',
+  '.heif',
+  '.dng',
+  '.arw',
+  '.cr2',
+  '.cr3',
+  '.nef',
+  '.orf',
+  '.rw2'
+])
+const VIDEO_EXTENSIONS = new Set([
+  '.mp4',
+  '.mov',
+  '.mkv',
+  '.avi',
+  '.mxf',
+  '.mts',
+  '.m2ts',
+  '.r3d',
+  '.braw',
+  '.prores',
+  '.webm'
+])
+
+type ScanControl = {
+  cancelled: boolean
+}
+
+let activeScanControl: ScanControl | null = null
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -90,37 +156,144 @@ function validateDriveRootPath(candidatePath: string | null): DrivePathValidatio
   }
 }
 
-/**
- * Recursively scans a directory and returns file metadata
- */
-function scanDirectoryRecursive(dirPath: string): {
-  name: string
-  path: string
-  size: number
-  extension: string
-}[] {
-  let results: ScannedFile[] = []
+function shouldIgnoreDirectory(name: string): boolean {
+  return HIDDEN_FOLDERS.has(name) || name.startsWith('.')
+}
 
-  const items = fs.readdirSync(dirPath, { withFileTypes: true })
+function shouldIgnoreFile(name: string): boolean {
+  return name === '.DS_Store'
+}
 
-  for (const item of items) {
-    const fullPath = path.join(dirPath, item.name)
+function detectFileType(extension: string): DetectedFileType {
+  if (IMAGE_EXTENSIONS.has(extension)) return 'image'
+  if (VIDEO_EXTENSIONS.has(extension)) return 'video'
+  return 'other'
+}
 
-    if (item.isDirectory()) {
-      results = results.concat(scanDirectoryRecursive(fullPath))
-    } else {
-      const stats = fs.statSync(fullPath)
+function ensureNotCancelled(control: ScanControl): void {
+  if (control.cancelled) {
+    throw new Error('Scan cancelled by user')
+  }
+}
 
-      results.push({
-        name: item.name,
-        path: fullPath,
-        size: stats.size,
-        extension: path.extname(item.name).toLowerCase()
-      })
+function hashFileSha256(filePath: string, control: ScanControl): Promise<string> {
+  return new Promise((resolve, reject) => {
+    ensureNotCancelled(control)
+
+    const hash = createHash('sha256')
+    const stream = fs.createReadStream(filePath)
+
+    stream.on('data', (chunk) => {
+      if (control.cancelled) {
+        stream.destroy(new Error('Scan cancelled by user'))
+        return
+      }
+
+      hash.update(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+    })
+
+    stream.on('error', (error: unknown) => {
+      reject(error)
+    })
+
+    stream.on('end', () => {
+      resolve(hash.digest('hex'))
+    })
+  })
+}
+
+async function collectFilesRecursive(
+  rootFolder: string,
+  currentFolder: string,
+  control: ScanControl,
+  collector: PlannedFile[]
+): Promise<void> {
+  ensureNotCancelled(control)
+
+  const entries = await fs.promises.readdir(currentFolder, { withFileTypes: true })
+
+  for (const entry of entries) {
+    ensureNotCancelled(control)
+
+    if (entry.isDirectory()) {
+      if (shouldIgnoreDirectory(entry.name)) {
+        continue
+      }
+
+      const nestedPath = path.join(currentFolder, entry.name)
+      await collectFilesRecursive(rootFolder, nestedPath, control, collector)
+      continue
     }
+
+    if (!entry.isFile()) {
+      continue
+    }
+
+    if (shouldIgnoreFile(entry.name)) {
+      continue
+    }
+
+    const fullPath = path.join(currentFolder, entry.name)
+    const relativePath = path.relative(rootFolder, fullPath)
+    const parentRelativeRaw = path.dirname(relativePath)
+    const parentRelativePath = parentRelativeRaw === '.' ? '/' : parentRelativeRaw
+    const extension = path.extname(entry.name).toLowerCase()
+
+    const stats = await fs.promises.stat(fullPath)
+    const sha256 = await hashFileSha256(fullPath, control)
+
+    collector.push({
+      name: entry.name,
+      fullPath,
+      relativePath,
+      parentRelativePath,
+      size: stats.size,
+      extension,
+      fileType: detectFileType(extension),
+      sha256
+    })
+  }
+}
+
+async function buildIngestionPlan(rootFolder: string, control: ScanControl): Promise<IngestionPlan> {
+  const files: PlannedFile[] = []
+  await collectFilesRecursive(rootFolder, rootFolder, control, files)
+  ensureNotCancelled(control)
+
+  const groupsMap = new Map<string, FolderGroup>()
+
+  for (const file of files) {
+    const existing = groupsMap.get(file.parentRelativePath)
+    if (existing) {
+      existing.fileCount += 1
+      existing.totalBytes += file.size
+      existing.typeCounts[file.fileType] += 1
+      continue
+    }
+
+    groupsMap.set(file.parentRelativePath, {
+      relativePath: file.parentRelativePath,
+      fileCount: 1,
+      totalBytes: file.size,
+      typeCounts: {
+        image: file.fileType === 'image' ? 1 : 0,
+        video: file.fileType === 'video' ? 1 : 0,
+        other: file.fileType === 'other' ? 1 : 0
+      }
+    })
   }
 
-  return results
+  const folderGroups = Array.from(groupsMap.values()).sort((a, b) => a.relativePath.localeCompare(b.relativePath))
+  const totalBytes = files.reduce((sum, file) => sum + file.size, 0)
+
+  return {
+    rootFolder,
+    scannedAt: new Date().toISOString(),
+    totalFiles: files.length,
+    totalBytes,
+    folderGroups,
+    files
+  }
 }
 
 function createWindow(): void {
@@ -181,12 +354,14 @@ app.whenReady().then(() => {
    * Folder scan
    */
   ipcMain.handle('scan-folder', async (_event, folderPath: string) => {
+    const scanControl: ScanControl = { cancelled: false }
+    activeScanControl = scanControl
+
     try {
-      const files = scanDirectoryRecursive(folderPath)
+      const plan = await buildIngestionPlan(folderPath, scanControl)
       const result: ScanResult = {
         success: true,
-        count: files.length,
-        files
+        plan
       }
       return result
     } catch (error: unknown) {
@@ -195,7 +370,19 @@ app.whenReady().then(() => {
         error: getErrorMessage(error)
       }
       return result
+    } finally {
+      if (activeScanControl === scanControl) {
+        activeScanControl = null
+      }
     }
+  })
+
+  ipcMain.handle('cancel-scan-folder', async () => {
+    if (activeScanControl) {
+      activeScanControl.cancelled = true
+    }
+
+    return { success: true }
   })
 
   ipcMain.handle('get-drive-root-path', async () => {

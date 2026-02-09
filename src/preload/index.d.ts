@@ -1,14 +1,40 @@
 import { ElectronAPI } from '@electron-toolkit/preload'
 
+type DetectedFileType = 'image' | 'video' | 'other'
+
 type ScannedFile = {
   name: string
-  path: string
+  fullPath: string
+  relativePath: string
+  parentRelativePath: string
   size: number
   extension: string
+  fileType: DetectedFileType
+  sha256: string
+}
+
+type FolderGroup = {
+  relativePath: string
+  fileCount: number
+  totalBytes: number
+  typeCounts: {
+    image: number
+    video: number
+    other: number
+  }
+}
+
+type IngestionPlan = {
+  rootFolder: string
+  scannedAt: string
+  totalFiles: number
+  totalBytes: number
+  folderGroups: FolderGroup[]
+  files: ScannedFile[]
 }
 
 type ScanResult =
-  | { success: true; count: number; files: ScannedFile[] }
+  | { success: true; plan: IngestionPlan }
   | { success: false; error: string }
 
 type DriveRootConfig = {
@@ -31,6 +57,7 @@ type SaveDriveRootResult = {
 interface GarudaApi {
   selectFolder: () => Promise<string | null>
   scanFolder: (folderPath: string) => Promise<ScanResult>
+  cancelScanFolder: () => Promise<{ success: boolean }>
   getDriveRootPath: () => Promise<DriveRootConfig>
   validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
   setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
