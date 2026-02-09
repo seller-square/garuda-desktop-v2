@@ -38,6 +38,7 @@ type IngestionPlan = {
 type SlotMappingSummary = {
   slotId: string
   slotLabel: string
+  slotCode: string
   fileCount: number
   totalBytes: number
   typeCounts: {
@@ -58,6 +59,7 @@ type SlotNamingConfig = {
 type RenamePlanItem = {
   slotId: string
   slotLabel: string
+  slotCode: string
   sourcePath: string
   sourceFilename: string
   oldFilename: string
@@ -67,15 +69,19 @@ type RenamePlanItem = {
   plannedFilename: string
   sha256: string
   sizeBytes: number
+  fileType: 'image' | 'video' | 'other'
 }
 
 type ExecutionPlanItem = {
   sourcePath: string
   sourceFilename: string
-  plannedName: string
+  destinationFilename: string
   destinationPath: string
   slotId: string
   slotLabel: string
+  slotCode: string
+  assetKind: 'IMG' | 'VID' | 'OTHER'
+  mimeType: string
   sha256: string
   sizeBytes: number
 }
@@ -134,6 +140,7 @@ type ProjectListItem = {
 type DashboardTab = 'scan' | 'plan' | 'execution' | 'settings'
 
 const SLOT_LABEL_KEYS = ['slot_name', 'name', 'title', 'slot_code', 'code', 'label']
+const SLOT_CODE_KEYS = ['slot_code', 'code', 'slot_name', 'name']
 const SLOT_SEQUENCE_KEYS = [
   'next_sequence_number',
   'current_sequence_number',
@@ -190,6 +197,11 @@ function getSlotSequence(slot: RowRecord): number | null {
   return pickFirstNumber(slot, SLOT_SEQUENCE_KEYS)
 }
 
+function getSlotCode(slot: RowRecord): string {
+  const value = pickFirstString(slot, SLOT_CODE_KEYS) ?? getSlotLabel(slot)
+  return normalizeSlotCode(value) || 'SLOT'
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -216,6 +228,30 @@ function getDefaultSlotPrefix(projectCode: string, slotLabel: string): string {
   const sanitizedProjectCode = sanitizeFilenameToken(projectCode)
   const sanitizedSlotLabel = sanitizeFilenameToken(slotLabel)
   return sanitizeFilenameToken(`${sanitizedProjectCode}_${sanitizedSlotLabel}`)
+}
+
+function getMimeTypeFromExtension(extension: string): string {
+  const ext = extension.toLowerCase()
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg'
+  if (ext === '.png') return 'image/png'
+  if (ext === '.gif') return 'image/gif'
+  if (ext === '.webp') return 'image/webp'
+  if (ext === '.heic' || ext === '.heif') return 'image/heic'
+  if (ext === '.mp4') return 'video/mp4'
+  if (ext === '.mov') return 'video/quicktime'
+  if (ext === '.mkv') return 'video/x-matroska'
+  if (ext === '.avi') return 'video/x-msvideo'
+  if (ext === '.mxf') return 'application/mxf'
+  return 'application/octet-stream'
+}
+
+function getFileExtensionFromName(filename: string): string {
+  const lastDotIndex = filename.lastIndexOf('.')
+  if (lastDotIndex < 0) {
+    return ''
+  }
+
+  return filename.slice(lastDotIndex).toLowerCase()
 }
 
 function buildSlotNameFromFolderPath(folderRelativePath: string): string {
@@ -286,6 +322,8 @@ function App() {
   const [creatingSlotForFolder, setCreatingSlotForFolder] = useState<string | null>(null)
   const [executionRunning, setExecutionRunning] = useState(false)
   const [executionValidation, setExecutionValidation] = useState<ExecutionValidation | null>(null)
+  const [uploadRunning, setUploadRunning] = useState(false)
+  const [uploadResultMessage, setUploadResultMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
 
   const selectedProject = useMemo(
     () => projects.find((project) => getId(project) === selectedProjectId) ?? null,
@@ -341,6 +379,7 @@ function App() {
       if (!slot) continue
 
       const slotLabel = getSlotLabel(slot)
+      const slotCode = getSlotCode(slot)
       const filesForFolder = folderToFiles.get(group.relativePath) ?? []
 
       const current = slotSummariesMap.get(slotId)
@@ -348,6 +387,7 @@ function App() {
         slotSummariesMap.set(slotId, {
           slotId,
           slotLabel,
+          slotCode,
           fileCount: filesForFolder.length,
           totalBytes: filesForFolder.reduce((sum, file) => sum + file.size, 0),
           typeCounts: {
@@ -452,6 +492,7 @@ function App() {
         renamePlan.push({
           slotId: summary.slotId,
           slotLabel: summary.slotLabel,
+          slotCode: summary.slotCode,
           sourcePath: file.fullPath,
           sourceFilename: file.name,
           oldFilename: file.name,
@@ -460,7 +501,8 @@ function App() {
           plannedSequence,
           plannedFilename,
           sha256: file.sha256,
-          sizeBytes: file.size
+          sizeBytes: file.size,
+          fileType: file.fileType
         })
       }
     }
@@ -532,10 +574,13 @@ function App() {
     return mappingPlan.renamePlan.map((item) => ({
       sourcePath: item.sourcePath,
       sourceFilename: item.sourceFilename,
-      plannedName: item.plannedFilename,
-      destinationPath: `drive://${projectCode}/slot/${item.slotId}/${item.plannedFilename}`,
+      destinationFilename: item.plannedFilename,
+      destinationPath: `drive://${projectCode}/source/${item.fileType === 'image' ? 'IMG' : item.fileType === 'video' ? 'VID' : 'OTHER'}/${item.slotCode}/${item.plannedFilename}`,
       slotId: item.slotId,
       slotLabel: item.slotLabel,
+      slotCode: item.slotCode,
+      assetKind: item.fileType === 'image' ? 'IMG' : item.fileType === 'video' ? 'VID' : 'OTHER',
+      mimeType: getMimeTypeFromExtension(getFileExtensionFromName(item.sourceFilename)),
       sha256: item.sha256,
       sizeBytes: item.sizeBytes
     }))
@@ -739,6 +784,7 @@ function App() {
       setFolderSlotAssignments({})
       setSlotNamingOverrides({})
       setExecutionValidation(null)
+      setUploadResultMessage(null)
       return
     }
 
@@ -755,6 +801,7 @@ function App() {
     setSlotNamingOverrides({})
     setMappingMessage(null)
     setExecutionValidation(null)
+    setUploadResultMessage(null)
   }
 
   const handleScan = async () => {
@@ -765,6 +812,7 @@ function App() {
     setSlotNamingOverrides({})
     setMappingMessage(null)
     setExecutionValidation(null)
+    setUploadResultMessage(null)
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
     setScanning(false)
@@ -776,6 +824,7 @@ function App() {
 
   const handleAssignFolderToSlot = (folderRelativePath: string, slotId: string) => {
     setExecutionValidation(null)
+    setUploadResultMessage(null)
     setFolderSlotAssignments((current) => {
       if (!slotId) {
         const next = { ...current }
@@ -792,6 +841,7 @@ function App() {
 
   const handleSlotPrefixOverride = (slotId: string, prefix: string) => {
     setExecutionValidation(null)
+    setUploadResultMessage(null)
     setSlotNamingOverrides((current) => ({
       ...current,
       [slotId]: {
@@ -803,6 +853,7 @@ function App() {
 
   const handleSlotPaddingOverride = (slotId: string, rawPadding: string) => {
     setExecutionValidation(null)
+    setUploadResultMessage(null)
     const parsed = Number.parseInt(rawPadding, 10)
     const padding = Number.isFinite(parsed) ? Math.min(8, Math.max(1, parsed)) : 4
 
@@ -923,6 +974,49 @@ function App() {
       })
     } finally {
       setExecutionRunning(false)
+    }
+  }
+
+  const handleExecuteDriveUpload = async () => {
+    if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject) {
+      return
+    }
+
+    setUploadRunning(true)
+    setUploadResultMessage(null)
+
+    try {
+      const projectCode = selectedProject.project_code?.trim() || 'PROJECT'
+      const response = await window.api.executeDriveUploadPlan(
+        executionPlan.map((item) => ({
+          sourcePath: item.sourcePath,
+          destinationFilename: item.destinationFilename,
+          projectCode,
+          slotCode: item.slotCode,
+          assetKind: item.assetKind,
+          mimeType: item.mimeType
+        }))
+      )
+
+      if (response.success) {
+        setUploadResultMessage({
+          kind: 'success',
+          text: `Uploaded ${response.uploadedCount} file(s) to Google Drive via streaming.`
+        })
+        return
+      }
+
+      setUploadResultMessage({
+        kind: 'error',
+        text: `Upload stopped after ${response.uploadedCount} file(s). Failed file: ${response.failedItem.destinationFilename}. ${response.error}`
+      })
+    } catch (error: unknown) {
+      setUploadResultMessage({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Drive upload failed.'
+      })
+    } finally {
+      setUploadRunning(false)
     }
   }
 
@@ -1441,10 +1535,11 @@ function App() {
                   {executionRunning ? 'Running Dry Run...' : 'Run Streaming Dry Run'}
                 </button>
                 <button
-                  disabled={!executionValidation?.executionReady}
-                  style={!executionValidation?.executionReady ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                  onClick={handleExecuteDriveUpload}
+                  disabled={!executionValidation?.executionReady || uploadRunning}
+                  style={!executionValidation?.executionReady || uploadRunning ? styles.actionButtonDisabled : styles.actionButtonSecondary}
                 >
-                  Upload Phase Disabled (Phase 6)
+                  {uploadRunning ? 'Uploading (Serial)...' : 'Execute Drive Upload'}
                 </button>
               </div>
 
@@ -1452,6 +1547,12 @@ function App() {
                 <div style={executionValidation.executionReady ? styles.successBanner : styles.errorBanner}>
                   executionReady = {String(executionValidation.executionReady)} | allFilesReadable ={' '}
                   {String(executionValidation.allFilesReadable)} | noCriticalErrors = {String(executionValidation.noCriticalErrors)}
+                </div>
+              )}
+
+              {uploadResultMessage && (
+                <div style={uploadResultMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
+                  {uploadResultMessage.text}
                 </div>
               )}
 
@@ -1488,7 +1589,7 @@ function App() {
                         <div key={`${item.slotId}-${item.sourcePath}`} style={styles.renameGridRow}>
                           <span style={styles.mappingFileCell}>{item.slotLabel}</span>
                           <span style={styles.mappingFolderCell}>{item.sourceFilename}</span>
-                          <span style={styles.renameOkCell}>{item.plannedName}</span>
+                          <span style={styles.renameOkCell}>{item.destinationFilename}</span>
                         </div>
                       ))}
                     </div>

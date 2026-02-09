@@ -31,6 +31,19 @@ const api = {
 
   dryRunStreamOpen: (items: Array<{ sourcePath: string; expectedSizeBytes: number }>) => {
     return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
+  },
+
+  executeDriveUploadPlan: (
+    items: Array<{
+      sourcePath: string
+      destinationFilename: string
+      projectCode: string
+      slotCode: string
+      assetKind: 'IMG' | 'VID' | 'OTHER'
+      mimeType: string
+    }>
+  ) => {
+    return electronAPI.ipcRenderer.invoke('execute-drive-upload-plan', items)
   }
 }
 

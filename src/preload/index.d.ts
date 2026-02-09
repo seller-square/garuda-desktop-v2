@@ -75,6 +75,32 @@ type DryRunResult = {
   results: DryRunFileResult[]
 }
 
+type DriveExecutionUploadItem = {
+  sourcePath: string
+  destinationFilename: string
+  projectCode: string
+  slotCode: string
+  assetKind: 'IMG' | 'VID' | 'OTHER'
+  mimeType: string
+}
+
+type DriveUploadResultItem = {
+  sourcePath: string
+  destinationFilename: string
+  fileId: string
+  driveFolderId: string
+}
+
+type ExecuteDriveUploadResult =
+  | { success: true; uploadedCount: number; results: DriveUploadResultItem[] }
+  | {
+      success: false
+      uploadedCount: number
+      results: DriveUploadResultItem[]
+      failedItem: DriveExecutionUploadItem
+      error: string
+    }
+
 interface GarudaApi {
   selectFolder: () => Promise<string | null>
   scanFolder: (folderPath: string) => Promise<ScanResult>
@@ -83,6 +109,7 @@ interface GarudaApi {
   validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
   setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
   dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
+  executeDriveUploadPlan: (items: DriveExecutionUploadItem[]) => Promise<ExecuteDriveUploadResult>
 }
 
 declare global {

@@ -70,6 +70,36 @@ type DryRunFileResult = {
   currentSizeBytes: number | null
 }
 
+type ExecutionUploadItem = {
+  sourcePath: string
+  destinationFilename: string
+  projectCode: string
+  slotCode: string
+  assetKind: 'IMG' | 'VID' | 'OTHER'
+  mimeType: string
+}
+
+type UploadResultItem = {
+  sourcePath: string
+  destinationFilename: string
+  fileId: string
+  driveFolderId: string
+}
+
+type ExecuteUploadResult =
+  | {
+      success: true
+      uploadedCount: number
+      results: UploadResultItem[]
+    }
+  | {
+      success: false
+      uploadedCount: number
+      results: UploadResultItem[]
+      failedItem: ExecutionUploadItem
+      error: string
+    }
+
 const CONFIG_FILE_NAME = 'garuda-config.json'
 const HIDDEN_FOLDERS = new Set(['.git', 'node_modules'])
 const IMAGE_EXTENSIONS = new Set([
@@ -110,6 +140,7 @@ type ScanControl = {
 }
 
 let activeScanControl: ScanControl | null = null
+const DRIVE_FOLDER_MIME = 'application/vnd.google-apps.folder'
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -201,6 +232,131 @@ function probeReadStream(sourcePath: string): Promise<void> {
       reject(error)
     })
   })
+}
+
+function escapeDriveQueryValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+class DriveUploadAdapter {
+  private readonly drive: any
+  private readonly rootFolderId: string
+  private readonly folderIdCache = new Map<string, string>()
+
+  constructor(drive: any, rootFolderId: string) {
+    this.drive = drive
+    this.rootFolderId = rootFolderId
+  }
+
+  static createFromEnv(): DriveUploadAdapter {
+    const clientEmail = process.env.GARUDA_GDRIVE_CLIENT_EMAIL
+    const privateKeyRaw = process.env.GARUDA_GDRIVE_PRIVATE_KEY
+    const rootFolderId = process.env.GARUDA_GDRIVE_ROOT_FOLDER_ID
+
+    if (!clientEmail || !privateKeyRaw || !rootFolderId) {
+      throw new Error(
+        'Missing Google Drive credentials. Set GARUDA_GDRIVE_CLIENT_EMAIL, GARUDA_GDRIVE_PRIVATE_KEY, GARUDA_GDRIVE_ROOT_FOLDER_ID.'
+      )
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { google } = require('googleapis')
+    const auth = new google.auth.JWT({
+      email: clientEmail,
+      key: privateKeyRaw.replace(/\\n/g, '\n'),
+      scopes: ['https://www.googleapis.com/auth/drive']
+    })
+
+    const drive = google.drive({ version: 'v3', auth })
+    return new DriveUploadAdapter(drive, rootFolderId)
+  }
+
+  private async resolveOrCreateFolder(name: string, parentFolderId: string): Promise<string> {
+    const cacheKey = `${parentFolderId}|${name}`
+    const cached = this.folderIdCache.get(cacheKey)
+    if (cached) {
+      return cached
+    }
+
+    const query = [
+      `name = '${escapeDriveQueryValue(name)}'`,
+      `mimeType = '${DRIVE_FOLDER_MIME}'`,
+      `'${escapeDriveQueryValue(parentFolderId)}' in parents`,
+      'trashed = false'
+    ].join(' and ')
+
+    const listResponse = await this.drive.files.list({
+      q: query,
+      fields: 'files(id,name)',
+      pageSize: 1,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true
+    })
+
+    const existingFolder = listResponse.data.files?.[0]
+    if (existingFolder?.id) {
+      this.folderIdCache.set(cacheKey, existingFolder.id)
+      return existingFolder.id
+    }
+
+    const createResponse = await this.drive.files.create({
+      requestBody: {
+        name,
+        mimeType: DRIVE_FOLDER_MIME,
+        parents: [parentFolderId]
+      },
+      fields: 'id',
+      supportsAllDrives: true
+    })
+
+    const createdId = createResponse.data.id
+    if (!createdId) {
+      throw new Error(`Failed to create folder "${name}" under parent "${parentFolderId}".`)
+    }
+
+    this.folderIdCache.set(cacheKey, createdId)
+    return createdId
+  }
+
+  private async resolveDestinationFolderId(projectCode: string, assetKind: string, slotCode: string): Promise<string> {
+    const projectFolderId = await this.resolveOrCreateFolder(projectCode, this.rootFolderId)
+    const sourceFolderId = await this.resolveOrCreateFolder('source', projectFolderId)
+    const assetFolderId = await this.resolveOrCreateFolder(assetKind, sourceFolderId)
+    return this.resolveOrCreateFolder(slotCode, assetFolderId)
+  }
+
+  async uploadStream(item: ExecutionUploadItem): Promise<UploadResultItem> {
+    const destinationFolderId = await this.resolveDestinationFolderId(item.projectCode, item.assetKind, item.slotCode)
+
+    const stream = fs.createReadStream(item.sourcePath)
+    try {
+      const response = await this.drive.files.create({
+        requestBody: {
+          name: item.destinationFilename,
+          parents: [destinationFolderId]
+        },
+        media: {
+          mimeType: item.mimeType || 'application/octet-stream',
+          body: stream
+        },
+        fields: 'id,name',
+        supportsAllDrives: true
+      })
+
+      if (!response.data.id) {
+        throw new Error('Google Drive upload succeeded without a file id.')
+      }
+
+      return {
+        sourcePath: item.sourcePath,
+        destinationFilename: item.destinationFilename,
+        fileId: response.data.id,
+        driveFolderId: destinationFolderId
+      }
+    } finally {
+      stream.destroy()
+    }
+  }
 }
 
 function shouldIgnoreDirectory(name: string): boolean {
@@ -528,6 +684,32 @@ app.whenReady().then(() => {
 
     return {
       success: true,
+      results
+    }
+  })
+
+  ipcMain.handle('execute-drive-upload-plan', async (_event, items: ExecutionUploadItem[]): Promise<ExecuteUploadResult> => {
+    const adapter = DriveUploadAdapter.createFromEnv()
+    const results: UploadResultItem[] = []
+
+    for (const item of items) {
+      try {
+        const uploaded = await adapter.uploadStream(item)
+        results.push(uploaded)
+      } catch (error: unknown) {
+        return {
+          success: false,
+          uploadedCount: results.length,
+          results,
+          failedItem: item,
+          error: getErrorMessage(error)
+        }
+      }
+    }
+
+    return {
+      success: true,
+      uploadedCount: results.length,
       results
     }
   })
