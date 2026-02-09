@@ -16,12 +16,15 @@ type ScanResult =
   | { success: false; error: string }
 
 type RowRecord = Record<string, unknown>
+type ProjectListItem = {
+  id: string
+  project_code: string | null
+  cached_brand_name: string | null
+  project_uploads?: Array<{ created_at: string | null }> | null
+}
 
 type DashboardTab = 'scan' | 'plan' | 'ingest' | 'settings'
 
-const PROJECT_LABEL_KEYS = ['display_name', 'name', 'project_name', 'title', 'project_code', 'code', 'slug']
-const PROJECT_CODE_KEYS = ['project_code', 'code', 'slug']
-const PROJECT_BRAND_KEYS = ['brand_name', 'name']
 const SLOT_LABEL_KEYS = ['slot_name', 'name', 'title', 'slot_code', 'code', 'label']
 const SLOT_SEQUENCE_KEYS = [
   'next_sequence_number',
@@ -63,43 +66,12 @@ function pickFirstNumber(row: RowRecord, keys: string[]): number | null {
   return null
 }
 
-function getProjectLabel(project: RowRecord): string {
-  return pickFirstString(project, PROJECT_LABEL_KEYS) ?? `Project ${getId(project).slice(0, 8)}`
+function getProjectCode(project: ProjectListItem): string {
+  return project.project_code?.trim() || '—'
 }
 
-function getProjectCode(project: RowRecord): string | null {
-  return pickFirstString(project, PROJECT_CODE_KEYS)
-}
-
-function getProjectBrandName(project: RowRecord): string | null {
-  const directBrandName = pickFirstString(project, PROJECT_BRAND_KEYS)
-  if (directBrandName) {
-    return directBrandName
-  }
-
-  const brandRelations = [project.brand, project.brands]
-
-  for (const relation of brandRelations) {
-    if (relation && typeof relation === 'object' && !Array.isArray(relation)) {
-      const nestedBrandName = pickFirstString(relation as RowRecord, PROJECT_BRAND_KEYS)
-      if (nestedBrandName) {
-        return nestedBrandName
-      }
-    }
-
-    if (Array.isArray(relation)) {
-      for (const item of relation) {
-        if (item && typeof item === 'object') {
-          const nestedBrandName = pickFirstString(item as RowRecord, PROJECT_BRAND_KEYS)
-          if (nestedBrandName) {
-            return nestedBrandName
-          }
-        }
-      }
-    }
-  }
-
-  return null
+function getProjectBrandName(project: ProjectListItem): string {
+  return project.cached_brand_name?.trim() || '—'
 }
 
 function getSlotLabel(slot: RowRecord): string {
@@ -146,7 +118,7 @@ function App() {
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
 
-  const [projects, setProjects] = useState<RowRecord[]>([])
+  const [projects, setProjects] = useState<ProjectListItem[]>([])
   const [projectsLoading, setProjectsLoading] = useState(false)
   const [projectsError, setProjectsError] = useState<string | null>(null)
   const [projectSearch, setProjectSearch] = useState('')
@@ -187,10 +159,9 @@ function App() {
     if (!query) return projects
 
     return projects.filter((project) => {
-      const label = getProjectLabel(project).toLowerCase()
-      const code = (getProjectCode(project) ?? '').toLowerCase()
-      const brand = (getProjectBrandName(project) ?? '').toLowerCase()
-      return label.includes(query) || code.includes(query) || brand.includes(query)
+      const code = (project.project_code ?? '').toLowerCase()
+      const brand = (project.cached_brand_name ?? '').toLowerCase()
+      return code.includes(query) || brand.includes(query)
     })
   }, [projects, projectSearch])
 
@@ -198,26 +169,18 @@ function App() {
     setProjectsLoading(true)
     setProjectsError(null)
 
-    let data: RowRecord[] | null = null
-    let error: Error | null = null
-
-    const selectAttempts = [
-      '*, brands(brand_name, name)',
-      '*, brand:brands(brand_name, name)',
-      '*',
-    ]
-
-    for (const selectQuery of selectAttempts) {
-      const response = await supabase.from('projects').select(selectQuery)
-
-      if (!response.error) {
-        data = (response.data ?? []) as unknown as RowRecord[]
-        error = null
-        break
-      }
-
-      error = response.error
-    }
+    const { data, error } = await supabase
+      .from('projects')
+      .select(
+        `
+          id,
+          project_code,
+          cached_brand_name,
+          project_uploads(created_at)
+        `
+      )
+      .not('project_status_id', 'in', '(4,5,16)')
+      .order('project_code', { ascending: false })
 
     if (error) {
       setProjectsError(error.message)
@@ -227,9 +190,7 @@ function App() {
       return
     }
 
-    const rows = (data ?? []) as RowRecord[]
-
-    rows.sort((a, b) => getProjectLabel(a).localeCompare(getProjectLabel(b)))
+    const rows = (data ?? []) as unknown as ProjectListItem[]
 
     setProjects(rows)
     setProjectsLoading(false)
@@ -499,8 +460,8 @@ function App() {
                     style={selected ? styles.projectRowSelected : styles.projectRow}
                     onClick={() => setSelectedProjectId(id)}
                   >
-                    <span style={styles.projectTitle}>{code ?? getProjectLabel(project)}</span>
-                    <span style={styles.projectSub}>{brandName ?? '—'}</span>
+                    <span style={styles.projectTitle}>{code}</span>
+                    <span style={styles.projectSub}>{brandName}</span>
                   </button>
                 )
               })
@@ -584,7 +545,7 @@ function App() {
             <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>Upload Dashboard</h1>
             <p style={{ color: '#94a3b8', margin: 0 }}>
               {selectedProject
-                ? `${getProjectLabel(selectedProject)}${selectedSlot ? ` / ${getSlotLabel(selectedSlot)}` : ''}`
+                ? `${getProjectCode(selectedProject)}${selectedSlot ? ` / ${getSlotLabel(selectedSlot)}` : ''}`
                 : 'Select a project and slot to continue'}
             </p>
           </div>
