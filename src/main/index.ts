@@ -54,6 +54,22 @@ type DrivePathValidation = {
   error: string | null
 }
 
+type DryRunRequestItem = {
+  sourcePath: string
+  expectedSizeBytes: number
+}
+
+type DryRunErrorType = 'missing' | 'permission' | 'unreadable' | 'zero_byte' | 'hash_mismatch'
+
+type DryRunFileResult = {
+  sourcePath: string
+  ok: boolean
+  errorType: DryRunErrorType | null
+  message: string | null
+  expectedSizeBytes: number
+  currentSizeBytes: number | null
+}
+
 const CONFIG_FILE_NAME = 'garuda-config.json'
 const HIDDEN_FOLDERS = new Set(['.git', 'node_modules'])
 const IMAGE_EXTENSIONS = new Set([
@@ -154,6 +170,37 @@ function validateDriveRootPath(candidatePath: string | null): DrivePathValidatio
       error: `Invalid path: ${getErrorMessage(error)}`
     }
   }
+}
+
+function classifyFsError(error: unknown): DryRunErrorType {
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    const code = String(error.code)
+    if (code === 'ENOENT') return 'missing'
+    if (code === 'EACCES' || code === 'EPERM') return 'permission'
+  }
+
+  return 'unreadable'
+}
+
+function probeReadStream(sourcePath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(sourcePath)
+
+    stream.once('open', () => {
+      stream.close((error) => {
+        if (error) {
+          reject(error)
+          return
+        }
+
+        resolve()
+      })
+    })
+
+    stream.once('error', (error) => {
+      reject(error)
+    })
+  })
 }
 
 function shouldIgnoreDirectory(name: string): boolean {
@@ -411,6 +458,78 @@ app.whenReady().then(() => {
     })
 
     return { success: true, driveRootPath: validation.normalizedPath, error: null }
+  })
+
+  ipcMain.handle('dry-run-stream-open', async (_event, items: DryRunRequestItem[]) => {
+    const results: DryRunFileResult[] = []
+
+    for (const item of items) {
+      try {
+        const stats = await fs.promises.stat(item.sourcePath)
+
+        if (!stats.isFile()) {
+          results.push({
+            sourcePath: item.sourcePath,
+            ok: false,
+            errorType: 'unreadable',
+            message: 'Path is not a regular file.',
+            expectedSizeBytes: item.expectedSizeBytes,
+            currentSizeBytes: null
+          })
+          continue
+        }
+
+        if (stats.size === 0) {
+          results.push({
+            sourcePath: item.sourcePath,
+            ok: false,
+            errorType: 'zero_byte',
+            message: 'File size is zero bytes.',
+            expectedSizeBytes: item.expectedSizeBytes,
+            currentSizeBytes: stats.size
+          })
+          continue
+        }
+
+        if (stats.size !== item.expectedSizeBytes) {
+          results.push({
+            sourcePath: item.sourcePath,
+            ok: false,
+            errorType: 'hash_mismatch',
+            message: `Expected ${item.expectedSizeBytes} bytes, found ${stats.size} bytes.`,
+            expectedSizeBytes: item.expectedSizeBytes,
+            currentSizeBytes: stats.size
+          })
+          continue
+        }
+
+        await probeReadStream(item.sourcePath)
+
+        results.push({
+          sourcePath: item.sourcePath,
+          ok: true,
+          errorType: null,
+          message: null,
+          expectedSizeBytes: item.expectedSizeBytes,
+          currentSizeBytes: stats.size
+        })
+      } catch (error: unknown) {
+        const errorType = classifyFsError(error)
+        results.push({
+          sourcePath: item.sourcePath,
+          ok: false,
+          errorType,
+          message: getErrorMessage(error),
+          expectedSizeBytes: item.expectedSizeBytes,
+          currentSizeBytes: null
+        })
+      }
+    }
+
+    return {
+      success: true,
+      results
+    }
   })
 
   createWindow()

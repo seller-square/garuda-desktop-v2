@@ -57,6 +57,27 @@ declare global {
     error: string | null
   }
 
+  type DryRunRequestItem = {
+    sourcePath: string
+    expectedSizeBytes: number
+  }
+
+  type DryRunErrorType = 'missing' | 'permission' | 'unreadable' | 'zero_byte' | 'hash_mismatch'
+
+  type DryRunFileResult = {
+    sourcePath: string
+    ok: boolean
+    errorType: DryRunErrorType | null
+    message: string | null
+    expectedSizeBytes: number
+    currentSizeBytes: number | null
+  }
+
+  type DryRunResult = {
+    success: boolean
+    results: DryRunFileResult[]
+  }
+
   interface Window {
     api: {
       selectFolder: () => Promise<string | null>
@@ -65,6 +86,7 @@ declare global {
       getDriveRootPath: () => Promise<DriveRootConfig>
       validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
       setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
+      dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
     }
   }
 }

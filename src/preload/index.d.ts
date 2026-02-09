@@ -54,6 +54,27 @@ type SaveDriveRootResult = {
   error: string | null
 }
 
+type DryRunRequestItem = {
+  sourcePath: string
+  expectedSizeBytes: number
+}
+
+type DryRunErrorType = 'missing' | 'permission' | 'unreadable' | 'zero_byte' | 'hash_mismatch'
+
+type DryRunFileResult = {
+  sourcePath: string
+  ok: boolean
+  errorType: DryRunErrorType | null
+  message: string | null
+  expectedSizeBytes: number
+  currentSizeBytes: number | null
+}
+
+type DryRunResult = {
+  success: boolean
+  results: DryRunFileResult[]
+}
+
 interface GarudaApi {
   selectFolder: () => Promise<string | null>
   scanFolder: (folderPath: string) => Promise<ScanResult>
@@ -61,6 +82,7 @@ interface GarudaApi {
   getDriveRootPath: () => Promise<DriveRootConfig>
   validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
   setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
+  dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
 }
 
 declare global {

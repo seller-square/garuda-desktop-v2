@@ -27,6 +27,10 @@ const api = {
 
   setDriveRootPath: (candidatePath: string | null) => {
     return electronAPI.ipcRenderer.invoke('set-drive-root-path', candidatePath)
+  },
+
+  dryRunStreamOpen: (items: Array<{ sourcePath: string; expectedSizeBytes: number }>) => {
+    return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
   }
 }
 

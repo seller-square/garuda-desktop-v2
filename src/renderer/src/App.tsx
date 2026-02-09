@@ -58,11 +58,42 @@ type SlotNamingConfig = {
 type RenamePlanItem = {
   slotId: string
   slotLabel: string
+  sourcePath: string
+  sourceFilename: string
   oldFilename: string
   oldRelativePath: string
   plannedName: string
   plannedSequence: number
   plannedFilename: string
+  sha256: string
+  sizeBytes: number
+}
+
+type ExecutionPlanItem = {
+  sourcePath: string
+  sourceFilename: string
+  plannedName: string
+  destinationPath: string
+  slotId: string
+  slotLabel: string
+  sha256: string
+  sizeBytes: number
+}
+
+type ExecutionError = {
+  slotId: string
+  slotLabel: string
+  sourcePath: string
+  sourceFilename: string
+  errorType: 'missing' | 'permission' | 'unreadable' | 'zero_byte' | 'hash_mismatch'
+  message: string
+}
+
+type ExecutionValidation = {
+  allFilesReadable: boolean
+  noCriticalErrors: boolean
+  executionReady: boolean
+  errors: ExecutionError[]
 }
 
 type MappingValidation = {
@@ -100,7 +131,7 @@ type ProjectListItem = {
   project_uploads?: Array<{ created_at: string | null }> | null
 }
 
-type DashboardTab = 'scan' | 'plan' | 'ingest' | 'settings'
+type DashboardTab = 'scan' | 'plan' | 'execution' | 'settings'
 
 const SLOT_LABEL_KEYS = ['slot_name', 'name', 'title', 'slot_code', 'code', 'label']
 const SLOT_SEQUENCE_KEYS = [
@@ -253,6 +284,8 @@ function App() {
   const [slotNamingOverrides, setSlotNamingOverrides] = useState<Record<string, SlotNamingOverride>>({})
   const [mappingMessage, setMappingMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
   const [creatingSlotForFolder, setCreatingSlotForFolder] = useState<string | null>(null)
+  const [executionRunning, setExecutionRunning] = useState(false)
+  const [executionValidation, setExecutionValidation] = useState<ExecutionValidation | null>(null)
 
   const selectedProject = useMemo(
     () => projects.find((project) => getId(project) === selectedProjectId) ?? null,
@@ -419,11 +452,15 @@ function App() {
         renamePlan.push({
           slotId: summary.slotId,
           slotLabel: summary.slotLabel,
+          sourcePath: file.fullPath,
+          sourceFilename: file.name,
           oldFilename: file.name,
           oldRelativePath: file.relativePath,
           plannedName,
           plannedSequence,
-          plannedFilename
+          plannedFilename,
+          sha256: file.sha256,
+          sizeBytes: file.size
         })
       }
     }
@@ -484,6 +521,67 @@ function App() {
       }
     }
   }, [folderSlotAssignments, scanResult, selectedProject?.project_code, selectedSlotId, slotById, slotNamingOverrides])
+
+  const executionPlan = useMemo<ExecutionPlanItem[]>(() => {
+    if (!mappingPlan || !selectedProject) {
+      return []
+    }
+
+    const projectCode = selectedProject.project_code?.trim() || 'PROJECT'
+
+    return mappingPlan.renamePlan.map((item) => ({
+      sourcePath: item.sourcePath,
+      sourceFilename: item.sourceFilename,
+      plannedName: item.plannedFilename,
+      destinationPath: `drive://${projectCode}/slot/${item.slotId}/${item.plannedFilename}`,
+      slotId: item.slotId,
+      slotLabel: item.slotLabel,
+      sha256: item.sha256,
+      sizeBytes: item.sizeBytes
+    }))
+  }, [mappingPlan, selectedProject])
+
+  const executionPlanBySlot = useMemo(() => {
+    const grouped = new Map<string, { slotLabel: string; items: ExecutionPlanItem[]; totalBytes: number }>()
+
+    for (const item of executionPlan) {
+      const existing = grouped.get(item.slotId)
+      if (existing) {
+        existing.items.push(item)
+        existing.totalBytes += item.sizeBytes
+      } else {
+        grouped.set(item.slotId, {
+          slotLabel: item.slotLabel,
+          items: [item],
+          totalBytes: item.sizeBytes
+        })
+      }
+    }
+
+    return Array.from(grouped.entries())
+      .map(([slotId, group]) => ({ slotId, ...group }))
+      .sort((a, b) => a.slotLabel.localeCompare(b.slotLabel))
+  }, [executionPlan])
+
+  const executionErrorsBySlot = useMemo(() => {
+    if (!executionValidation) {
+      return []
+    }
+
+    const grouped = new Map<string, { slotLabel: string; errors: ExecutionError[] }>()
+    for (const error of executionValidation.errors) {
+      const existing = grouped.get(error.slotId)
+      if (existing) {
+        existing.errors.push(error)
+      } else {
+        grouped.set(error.slotId, { slotLabel: error.slotLabel, errors: [error] })
+      }
+    }
+
+    return Array.from(grouped.entries())
+      .map(([slotId, group]) => ({ slotId, ...group }))
+      .sort((a, b) => a.slotLabel.localeCompare(b.slotLabel))
+  }, [executionValidation])
 
   const loadProjects = async (opts?: { keepSelection?: boolean }) => {
     setProjectsLoading(true)
@@ -640,6 +738,7 @@ function App() {
       setSelectedSlotId(null)
       setFolderSlotAssignments({})
       setSlotNamingOverrides({})
+      setExecutionValidation(null)
       return
     }
 
@@ -655,6 +754,7 @@ function App() {
     setFolderSlotAssignments({})
     setSlotNamingOverrides({})
     setMappingMessage(null)
+    setExecutionValidation(null)
   }
 
   const handleScan = async () => {
@@ -664,6 +764,7 @@ function App() {
     setFolderSlotAssignments({})
     setSlotNamingOverrides({})
     setMappingMessage(null)
+    setExecutionValidation(null)
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
     setScanning(false)
@@ -674,6 +775,7 @@ function App() {
   }
 
   const handleAssignFolderToSlot = (folderRelativePath: string, slotId: string) => {
+    setExecutionValidation(null)
     setFolderSlotAssignments((current) => {
       if (!slotId) {
         const next = { ...current }
@@ -689,6 +791,7 @@ function App() {
   }
 
   const handleSlotPrefixOverride = (slotId: string, prefix: string) => {
+    setExecutionValidation(null)
     setSlotNamingOverrides((current) => ({
       ...current,
       [slotId]: {
@@ -699,6 +802,7 @@ function App() {
   }
 
   const handleSlotPaddingOverride = (slotId: string, rawPadding: string) => {
+    setExecutionValidation(null)
     const parsed = Number.parseInt(rawPadding, 10)
     const padding = Number.isFinite(parsed) ? Math.min(8, Math.max(1, parsed)) : 4
 
@@ -749,6 +853,76 @@ function App() {
       setMappingMessage({ kind: 'error', text: errorText })
     } finally {
       setCreatingSlotForFolder(null)
+    }
+  }
+
+  const handleRunExecutionDryRun = async () => {
+    if (executionPlan.length === 0) {
+      setExecutionValidation({
+        allFilesReadable: false,
+        noCriticalErrors: false,
+        executionReady: false,
+        errors: [
+          {
+            slotId: 'unmapped',
+            slotLabel: 'Unmapped',
+            sourcePath: '',
+            sourceFilename: '',
+            errorType: 'unreadable',
+            message: 'No execution items. Complete folder-to-slot mapping first.'
+          }
+        ]
+      })
+      return
+    }
+
+    setExecutionRunning(true)
+
+    try {
+      const response = await window.api.dryRunStreamOpen(
+        executionPlan.map((item) => ({
+          sourcePath: item.sourcePath,
+          expectedSizeBytes: item.sizeBytes
+        }))
+      )
+
+      const itemBySourcePath = new Map<string, ExecutionPlanItem>()
+      for (const item of executionPlan) {
+        itemBySourcePath.set(item.sourcePath, item)
+      }
+
+      const errors: ExecutionError[] = []
+      for (const result of response.results) {
+        if (result.ok || !result.errorType) {
+          continue
+        }
+
+        const planItem = itemBySourcePath.get(result.sourcePath)
+        if (!planItem) {
+          continue
+        }
+
+        errors.push({
+          slotId: planItem.slotId,
+          slotLabel: planItem.slotLabel,
+          sourcePath: planItem.sourcePath,
+          sourceFilename: planItem.sourceFilename,
+          errorType: result.errorType,
+          message: result.message ?? 'Dry-run validation error'
+        })
+      }
+
+      const allFilesReadable = errors.length === 0
+      const noCriticalErrors = errors.length === 0
+
+      setExecutionValidation({
+        allFilesReadable,
+        noCriticalErrors,
+        executionReady: allFilesReadable && noCriticalErrors,
+        errors
+      })
+    } finally {
+      setExecutionRunning(false)
     }
   }
 
@@ -988,7 +1162,7 @@ function App() {
         )}
 
         <div style={styles.tabBar}>
-          {(['scan', 'plan', 'ingest', 'settings'] as DashboardTab[]).map((tab) => (
+          {(['scan', 'plan', 'execution', 'settings'] as DashboardTab[]).map((tab) => (
             <button
               key={tab}
               style={activeTab === tab ? styles.tabButtonActive : styles.tabButton}
@@ -1243,11 +1417,84 @@ function App() {
             </>
           )}
 
-          {activeTab === 'ingest' && (
+          {activeTab === 'execution' && (
             <>
-              {/* TODO(Phase 5/6): Execute copy + upload row writes with abort/resume journal. */}
-              <h3 style={styles.todoHeading}>Ingest (Phase 5)</h3>
-              <p style={styles.todoText}>File copy + `project_uploads` writes and abort/resume flow are not part of Phase 1.</p>
+              <h3 style={styles.todoHeading}>Execution (Streaming Dry Run)</h3>
+              <p style={styles.todoText}>
+                Files will be streamed and renamed at upload time. No local copies will be created.
+              </p>
+
+              <div style={styles.mappingSummaryPanel}>
+                <div style={styles.mappingSummaryText}>Total files: {executionPlan.length}</div>
+                <div style={styles.mappingSummaryText}>
+                  Total size: {formatBytes(executionPlan.reduce((sum, item) => sum + item.sizeBytes, 0))}
+                </div>
+                <div style={styles.mappingSummaryText}>Slots: {executionPlanBySlot.length}</div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
+                <button
+                  onClick={handleRunExecutionDryRun}
+                  disabled={executionRunning || executionPlan.length === 0}
+                  style={executionRunning || executionPlan.length === 0 ? styles.actionButtonDisabled : styles.actionButtonPrimary}
+                >
+                  {executionRunning ? 'Running Dry Run...' : 'Run Streaming Dry Run'}
+                </button>
+                <button
+                  disabled={!executionValidation?.executionReady}
+                  style={!executionValidation?.executionReady ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                >
+                  Upload Phase Disabled (Phase 6)
+                </button>
+              </div>
+
+              {executionValidation && (
+                <div style={executionValidation.executionReady ? styles.successBanner : styles.errorBanner}>
+                  executionReady = {String(executionValidation.executionReady)} | allFilesReadable ={' '}
+                  {String(executionValidation.allFilesReadable)} | noCriticalErrors = {String(executionValidation.noCriticalErrors)}
+                </div>
+              )}
+
+              {executionValidation && executionValidation.errors.length > 0 && (
+                <div style={styles.mappingSummaryPanel}>
+                  <h4 style={styles.mappingSummaryTitle}>Execution Errors</h4>
+                  {executionErrorsBySlot.map((slotGroup) => (
+                    <div key={slotGroup.slotId} style={styles.executionErrorGroup}>
+                      <div style={styles.executionSlotHeader}>{slotGroup.slotLabel}</div>
+                      {slotGroup.errors.map((error) => (
+                        <div key={`${error.slotId}-${error.sourcePath}`} style={styles.mappingWarning}>
+                          {error.sourceFilename || error.sourcePath}: {error.errorType} - {error.message}
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div style={styles.mappingSummaryPanel}>
+                <h4 style={styles.mappingSummaryTitle}>Execution Preview</h4>
+                <div style={styles.renameGridHeader}>
+                  <span>Slot</span>
+                  <span>Source Filename</span>
+                  <span>Planned Filename</span>
+                </div>
+                <div style={styles.renameGridBody}>
+                  {executionPlanBySlot.map((slotGroup) => (
+                    <div key={slotGroup.slotId} style={styles.executionSlotBlock}>
+                      <div style={styles.executionSlotHeader}>
+                        {slotGroup.slotLabel} · {slotGroup.items.length} files · {formatBytes(slotGroup.totalBytes)}
+                      </div>
+                      {slotGroup.items.map((item) => (
+                        <div key={`${item.slotId}-${item.sourcePath}`} style={styles.renameGridRow}>
+                          <span style={styles.mappingFileCell}>{item.slotLabel}</span>
+                          <span style={styles.mappingFolderCell}>{item.sourceFilename}</span>
+                          <span style={styles.renameOkCell}>{item.plannedName}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              </div>
             </>
           )}
 
@@ -1802,6 +2049,22 @@ const styles: Record<string, React.CSSProperties> = {
   renameDangerCell: {
     fontSize: 12,
     color: '#fca5a5'
+  },
+  executionSlotBlock: {
+    border: '1px solid #1e293b',
+    borderRadius: 8,
+    padding: 8
+  },
+  executionSlotHeader: {
+    fontSize: 12,
+    fontWeight: 700,
+    color: '#93c5fd',
+    marginBottom: 8
+  },
+  executionErrorGroup: {
+    display: 'grid',
+    gap: 6,
+    marginBottom: 10
   },
   fileRow: {
     fontSize: 13,
