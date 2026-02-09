@@ -33,8 +33,10 @@ type IngestionPlan = {
   root: string
   scannedAt: string
   totalFiles: number
+  totalFolders: number
   totalBytes: number
   totalSize: number
+  byExt: Record<string, number>
   folderGroups: FolderGroup[]
   folders: string[]
   files: ScannedFile[]
@@ -268,8 +270,10 @@ const EMPTY_INGESTION_PLAN: IngestionPlan = {
   root: '',
   scannedAt: '',
   totalFiles: 0,
+  totalFolders: 0,
   totalBytes: 0,
   totalSize: 0,
+  byExt: {},
   folderGroups: [],
   folders: [],
   files: []
@@ -406,11 +410,13 @@ function normalizeIngestionPlan(plan: unknown): IngestionPlan {
     ? (record.folders as unknown[]).filter((folder): folder is string => typeof folder === 'string')
     : folderGroups.map((group) => group.relativePath)
   const rootFolder =
-    typeof record.rootFolder === 'string'
-      ? record.rootFolder
-      : typeof record.root === 'string'
-        ? record.root
-        : ''
+    typeof record.rootPath === 'string'
+      ? record.rootPath
+      : typeof record.rootFolder === 'string'
+        ? record.rootFolder
+        : typeof record.root === 'string'
+          ? record.root
+          : ''
 
   return {
     rootFolder,
@@ -418,6 +424,12 @@ function normalizeIngestionPlan(plan: unknown): IngestionPlan {
     scannedAt: typeof record.scannedAt === 'string' ? record.scannedAt : new Date().toISOString(),
     totalFiles:
       typeof record.totalFiles === 'number' && Number.isFinite(record.totalFiles) ? record.totalFiles : normalizedFiles.length,
+    totalFolders:
+      typeof record.totalFolders === 'number' && Number.isFinite(record.totalFolders)
+        ? record.totalFolders
+        : Array.isArray(record.folders)
+          ? (record.folders as unknown[]).length + 1
+          : folderGroups.length + 1,
     totalBytes:
       typeof record.totalBytes === 'number' && Number.isFinite(record.totalBytes)
         ? record.totalBytes
@@ -432,6 +444,10 @@ function normalizeIngestionPlan(plan: unknown): IngestionPlan {
         : typeof record.totalBytes === 'number' && Number.isFinite(record.totalBytes)
           ? record.totalBytes
           : computedBytes,
+    byExt:
+      record.byExt && typeof record.byExt === 'object' && !Array.isArray(record.byExt)
+        ? (record.byExt as Record<string, number>)
+        : {},
     folderGroups: Array.isArray(record.folderGroups) ? (record.folderGroups as FolderGroup[]) : folderGroups,
     folders,
     files: normalizedFiles
@@ -445,6 +461,17 @@ function pathBasename(relativePath: string): string {
 
 function normalizeLocalPath(candidatePath: string): string {
   return candidatePath.trim().replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+type ApiMethodName = keyof Window['api']
+
+function getApi(): Partial<Window['api']> | null {
+  const apiCandidate = (window as Window & { api?: Partial<Window['api']> }).api
+  if (!apiCandidate || typeof apiCandidate !== 'object') {
+    return null
+  }
+
+  return apiCandidate
 }
 
 function getId(row: RowRecord): string {
@@ -679,16 +706,12 @@ function App() {
   const [activeTab, setActiveTab] = useState<DashboardTab>('scan')
 
   const [folderPath, setFolderPath] = useState<string | null>(null)
-  const [sourcePathValidation, setSourcePathValidation] = useState<FolderReadableValidation>({
-    valid: false,
-    normalizedPath: null,
-    error: null
-  })
   const [destinationPath, setDestinationPath] = useState<string | null>(null)
   const [destinationPathWarning, setDestinationPathWarning] = useState<string | null>(null)
   const [scanResult, setScanResult] = useState<ScanResult>({ success: true, plan: EMPTY_INGESTION_PLAN })
   const [scanHasRun, setScanHasRun] = useState(false)
   const [scanning, setScanning] = useState(false)
+  const [scanActionMessage, setScanActionMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
   const [folderSlotAssignments, setFolderSlotAssignments] = useState<Record<string, string>>({})
   const [slotNamingOverrides, setSlotNamingOverrides] = useState<Record<string, SlotNamingOverride>>({})
   const [executionRunning, setExecutionRunning] = useState(false)
@@ -702,6 +725,7 @@ function App() {
   const [verificationSummary, setVerificationSummary] = useState<VerificationResultSummary | null>(null)
   const [resumeNotice, setResumeNotice] = useState<string | null>(null)
   const [autoPreflightDoneKey, setAutoPreflightDoneKey] = useState<string | null>(null)
+  const [ipcMethodError, setIpcMethodError] = useState<string | null>(null)
 
   const selectedProject = useMemo(
     () => projects.find((project) => getId(project) === selectedProjectId) ?? null,
@@ -1155,6 +1179,23 @@ function App() {
       .sort((a, b) => a.slotLabel.localeCompare(b.slotLabel))
   }, [executionValidation])
 
+  const callApi = async <K extends ApiMethodName>(
+    methodName: K,
+    ...args: Parameters<Window['api'][K]>
+  ): Promise<Awaited<ReturnType<Window['api'][K]>> | null> => {
+    const api = getApi()
+    const method = api?.[methodName]
+    if (typeof method !== 'function') {
+      console.error('[ipc-missing]', methodName, { args })
+      setIpcMethodError(`Desktop IPC method missing: ${String(methodName)}. Rebuild required or preload mismatch.`)
+      return null
+    }
+
+    setIpcMethodError(null)
+    const fn = method as (...fnArgs: Parameters<Window['api'][K]>) => ReturnType<Window['api'][K]>
+    return (await fn(...args)) as Awaited<ReturnType<Window['api'][K]>>
+  }
+
   const loadProjects = async (opts?: { keepSelection?: boolean }) => {
     setProjectsLoading(true)
     setProjectsError(null)
@@ -1331,37 +1372,6 @@ function App() {
   }, [session])
 
   useEffect(() => {
-    if (!folderPath) {
-      setSourcePathValidation({
-        valid: false,
-        normalizedPath: null,
-        error: null
-      })
-      return
-    }
-
-    let isActive = true
-    window.api
-      .validateFolderReadable(folderPath)
-      .then((validation) => {
-        if (!isActive) return
-        setSourcePathValidation(validation)
-      })
-      .catch((error: unknown) => {
-        if (!isActive) return
-        setSourcePathValidation({
-          valid: false,
-          normalizedPath: null,
-          error: error instanceof Error ? error.message : 'Failed to validate source folder.'
-        })
-      })
-
-    return () => {
-      isActive = false
-    }
-  }, [folderPath])
-
-  useEffect(() => {
     if (activeTab !== 'execution') return
     if (!selectedProject || executionPlan.length === 0 || !destinationPath) return
 
@@ -1400,6 +1410,8 @@ function App() {
       setVerificationSummary(null)
       setResumeNotice(null)
       setAutoPreflightDoneKey(null)
+      setIpcMethodError(null)
+      setScanActionMessage(null)
       return
     }
 
@@ -1411,13 +1423,15 @@ function App() {
     setDestinationPathWarning(null)
     setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
     setScanHasRun(false)
+    setIpcMethodError(null)
+    setScanActionMessage(null)
     loadSlots(selectedProjectId).catch((error: unknown) => {
       setSlotsError(error instanceof Error ? error.message : 'Unknown error while fetching project slots')
     })
   }, [selectedProjectId])
 
   const handleSelectFolder = async () => {
-    const selectedPath = await window.api.selectFolder()
+    const selectedPath = await callApi('selectFolder')
     if (!selectedPath) {
       return
     }
@@ -1439,11 +1453,18 @@ function App() {
     setVerificationSummary(null)
     setResumeNotice(null)
     setAutoPreflightDoneKey(null)
+    setScanActionMessage(null)
   }
 
   const handleScan = async () => {
-    if (!folderPath || !sourcePathValidation.valid || !sourcePathValidation.normalizedPath) return
+    if (!folderPath) {
+      setScanActionMessage({ kind: 'error', text: 'Select a source folder first.' })
+      return
+    }
+
+    console.log('[scan-click]', { sourcePath: folderPath })
     setScanning(true)
+    setScanActionMessage(null)
     setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
     setScanHasRun(false)
     setFolderSlotAssignments({})
@@ -1456,7 +1477,20 @@ function App() {
     setResumeNotice(null)
     setAutoPreflightDoneKey(null)
     try {
-      const result = await window.api.scanFolder(sourcePathValidation.normalizedPath)
+      const result = await callApi('scanFolder', folderPath, {
+        ignoreHidden: true,
+        ignoreSystemFiles: true
+      })
+      if (!result) {
+        setScanResult({
+          success: false,
+          error: 'Scan IPC unavailable.'
+        })
+        setScanActionMessage({ kind: 'error', text: 'Scan IPC unavailable.' })
+        setScanHasRun(true)
+        return
+      }
+
       if (result && typeof result === 'object' && 'success' in result) {
         if (result.success) {
           const normalizedPlan = normalizeIngestionPlan(result.plan)
@@ -1464,10 +1498,18 @@ function App() {
             success: true,
             plan: normalizedPlan
           })
+          setScanActionMessage({
+            kind: 'success',
+            text: `Source scanned successfully. ${normalizedPlan.totalFiles} file(s) found.`
+          })
         } else {
           setScanResult({
             success: false,
             error: typeof result.error === 'string' ? result.error : 'Scan failed.'
+          })
+          setScanActionMessage({
+            kind: 'error',
+            text: typeof result.error === 'string' ? result.error : 'Scan failed.'
           })
         }
       } else {
@@ -1475,6 +1517,7 @@ function App() {
           success: false,
           error: 'Scan failed: invalid response.'
         })
+        setScanActionMessage({ kind: 'error', text: 'Scan failed: invalid response.' })
       }
       setScanHasRun(true)
     } catch (error: unknown) {
@@ -1483,6 +1526,7 @@ function App() {
         success: false,
         error: message
       })
+      setScanActionMessage({ kind: 'error', text: message })
       setScanHasRun(true)
     } finally {
       setScanning(false)
@@ -1491,7 +1535,7 @@ function App() {
 
   const handleCancelScan = async () => {
     try {
-      await window.api.cancelScanFolder()
+      await callApi('cancelScanFolder')
     } catch (error: unknown) {
       setScanResult({
         success: false,
@@ -1579,12 +1623,31 @@ function App() {
     setExecutionRunning(true)
 
     try {
-      const response = await window.api.dryRunStreamOpen(
+      const response = await callApi(
+        'dryRunStreamOpen',
         executionPlan.map((item) => ({
           sourcePath: item.sourcePath,
           expectedSizeBytes: item.sizeBytes
         }))
       )
+      if (!response) {
+        setExecutionValidation({
+          allFilesReadable: false,
+          noCriticalErrors: false,
+          executionReady: false,
+          errors: [
+            {
+              slotId: 'ipc',
+              slotLabel: 'IPC',
+              sourcePath: '',
+              sourceFilename: '',
+              errorType: 'unreadable',
+              message: 'Dry-run IPC method is unavailable.'
+            }
+          ]
+        })
+        return
+      }
 
       const itemBySourcePath = new Map<string, ExecutionPlanItem>()
       for (const item of executionPlan) {
@@ -1662,12 +1725,16 @@ function App() {
         }
       }
 
-      const dryRun = await window.api.dryRunStreamOpen(
+      const dryRun = await callApi(
+        'dryRunStreamOpen',
         executionPlan.map((item) => ({
           sourcePath: item.sourcePath,
           expectedSizeBytes: item.sizeBytes
         }))
       )
+      if (!dryRun) {
+        throw new Error('Dry-run IPC method is unavailable.')
+      }
       const dryRunByPath = new Map<string, DryRunFileResult>()
       for (const result of dryRun.results) {
         dryRunByPath.set(result.sourcePath, result)
@@ -1793,7 +1860,10 @@ function App() {
         expectedFilename: row.final_filename ?? null
       }))
 
-      const response = await window.api.verifyDestinationPaths(verifyItems)
+      const response = await callApi('verifyDestinationPaths', verifyItems)
+      if (!response) {
+        return
+      }
       const valid = response.results.filter((item) => item.exists && item.filenameMatches && item.sizeMatches).length
       const invalid = response.results.length - valid
 
@@ -1843,7 +1913,7 @@ function App() {
         executionPreflight.fileResults.filter((row) => row.status === 'pending_upload').map((row) => row.sha256)
       )
       const pendingItems = executionPlan.filter((item) => pendingShaSet.has(item.sha256))
-      const response = await window.api.executeFilesystemStreamPlan({
+      const response = await callApi('executeFilesystemStreamPlan', {
         accessToken: session.access_token,
         destinationRootPath: destinationPath,
         items: pendingItems.map((item) => ({
@@ -1862,6 +1932,9 @@ function App() {
           mimeType: item.mimeType
         }))
       })
+      if (!response) {
+        return
+      }
 
       if (response.success) {
         setUploadResultMessage({
@@ -1888,7 +1961,7 @@ function App() {
   }
 
   const handleSelectDestinationFolder = async () => {
-    const selectedPath = await window.api.selectFolder()
+    const selectedPath = await callApi('selectFolder')
     if (!selectedPath) return
 
     if (folderPath && normalizeLocalPath(folderPath) === normalizeLocalPath(selectedPath)) {
@@ -1898,6 +1971,32 @@ function App() {
 
     setDestinationPath(selectedPath)
     setDestinationPathWarning(null)
+    setScanActionMessage(null)
+  }
+
+  const handleProceedToPlan = () => {
+    if (!folderPath) {
+      setScanActionMessage({ kind: 'error', text: 'Select a source folder first.' })
+      return
+    }
+
+    if (!scanHasRun || !scanResult.success) {
+      setScanActionMessage({ kind: 'error', text: 'Run a scan first.' })
+      return
+    }
+
+    if (safeScanPlan.totalFiles <= 0) {
+      setScanActionMessage({ kind: 'error', text: 'Scan found 0 files. Select a valid source and scan again.' })
+      return
+    }
+
+    if (!destinationPath) {
+      setScanActionMessage({ kind: 'error', text: 'Select a destination folder before proceeding.' })
+      return
+    }
+
+    setScanActionMessage({ kind: 'success', text: 'Ready for planning with source and destination selected.' })
+    setActiveTab('plan')
   }
 
   if (loading) {
@@ -2042,6 +2141,8 @@ function App() {
             {slotsError && <div>Slots: {slotsError}</div>}
           </div>
         )}
+
+        {ipcMethodError && <div style={styles.errorBanner}>{ipcMethodError}</div>}
 
         {selectedProjectId && slotsConfigured && !showSlotWizard && (
           <div style={styles.slotWizardLaunchRow}>
@@ -2478,6 +2579,12 @@ function App() {
             <>
               <p style={styles.tabIntro}>Select and scan a source folder. Phase 3 will expand this into hash/type planning.</p>
 
+              {scanActionMessage && (
+                <div style={scanActionMessage.kind === 'error' ? styles.errorBannerCompact : styles.successBannerCompact}>
+                  {scanActionMessage.text}
+                </div>
+              )}
+
               <div style={{ display: 'flex', gap: 12, marginBottom: 20 }}>
                 <button onClick={handleSelectFolder} style={styles.actionButtonSecondary}>
                   <FolderOpen size={16} /> Select Folder
@@ -2485,8 +2592,8 @@ function App() {
 
                 <button
                   onClick={handleScan}
-                  disabled={!folderPath || !sourcePathValidation.valid || scanning}
-                  style={!folderPath || !sourcePathValidation.valid || scanning ? styles.actionButtonDisabled : styles.actionButtonPrimary}
+                  disabled={!folderPath || scanning}
+                  style={!folderPath || scanning ? styles.actionButtonDisabled : styles.actionButtonPrimary}
                 >
                   {scanning ? <Loader2 size={16} /> : <Scan size={16} />}
                   {scanning ? 'Scanning...' : 'Scan Folder'}
@@ -2500,9 +2607,6 @@ function App() {
               </div>
 
               {folderPath && <div style={styles.pathText}>Selected: {folderPath}</div>}
-              {folderPath && sourcePathValidation.error && (
-                <div style={styles.errorBanner}>Source folder is not readable: {sourcePathValidation.error}</div>
-              )}
               {destinationPath && <div style={styles.pathText}>Destination: {destinationPath}</div>}
               {!destinationPath && scanHasRun && scanResult.success && (
                 <div style={styles.mutedPanel}>Select a destination folder for the next execution phase.</div>
@@ -2515,6 +2619,13 @@ function App() {
                   style={!scanHasRun || !scanResult.success ? styles.actionButtonDisabled : styles.actionButtonSecondary}
                 >
                   <FolderOpen size={16} /> Select Destination
+                </button>
+                <button
+                  onClick={handleProceedToPlan}
+                  disabled={!scanHasRun || !scanResult.success}
+                  style={!scanHasRun || !scanResult.success ? styles.actionButtonDisabled : styles.actionButtonPrimary}
+                >
+                  Proceed to Plan
                 </button>
               </div>
 
@@ -2531,7 +2642,7 @@ function App() {
                     Root: {safeScanPlan.rootFolder}
                   </div>
                   <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4 }}>
-                    Total size: {formatBytes(safeScanPlan.totalBytes)} · Folders: {safeScanPlan.folderGroups.length}
+                    Total size: {formatBytes(safeScanPlan.totalBytes)} · Folders: {safeScanPlan.totalFolders}
                   </div>
                   <div style={{ marginTop: 12, maxHeight: 300, overflowY: 'auto' }}>
                     {safeScanPlan.folderGroups.map((group) => (

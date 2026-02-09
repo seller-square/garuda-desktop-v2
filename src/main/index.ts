@@ -25,9 +25,13 @@ type PlannedFile = {
 
 type IngestionPlan = {
   root: string
+  rootPath: string
   totalFiles: number
+  totalFolders: number
+  totalBytes: number
   totalSizeBytes: number
   foldersScanned: number
+  byExt: Record<string, number>
   folders: string[]
   files: PlannedFile[]
 }
@@ -35,6 +39,11 @@ type IngestionPlan = {
 type ScanResult =
   | { success: true; plan: IngestionPlan }
   | { success: false; error: string; plan: IngestionPlan }
+
+type ScanOptions = {
+  ignoreHidden?: boolean
+  ignoreSystemFiles?: boolean
+}
 
 type DryRunRequestItem = {
   sourcePath: string
@@ -140,7 +149,7 @@ type ExecutionResult = {
   error?: string
 }
 
-const HIDDEN_FOLDERS = new Set(['.git', 'node_modules'])
+const HIDDEN_FOLDERS = new Set(['.git', 'node_modules', '__MACOSX'])
 const IMAGE_EXTENSIONS = new Set([
   '.jpg',
   '.jpeg',
@@ -395,8 +404,10 @@ async function collectFilesRecursive(
   rootFolder: string,
   currentFolder: string,
   control: ScanControl,
+  options: ScanOptions,
   collector: PlannedFile[],
-  folders: Set<string>
+  folders: Set<string>,
+  byExt: Record<string, number>
 ): Promise<void> {
   ensureNotCancelled(control)
 
@@ -409,26 +420,33 @@ async function collectFilesRecursive(
 
   for (const entry of entries) {
     ensureNotCancelled(control)
-
-    if (shouldIgnoreDirectory(entry.name)) {
-      continue
-    }
-
     const fullPath = path.join(currentFolder, entry.name)
 
     try {
-      const stats = entry.isSymbolicLink() ? await fs.promises.stat(fullPath) : null
-      const isDirectory = entry.isDirectory() || (entry.isSymbolicLink() && Boolean(stats?.isDirectory()))
-      const isFile = entry.isFile() || (entry.isSymbolicLink() && Boolean(stats?.isFile()))
-
-      if (isDirectory) {
-        const relativeFolder = path.relative(rootFolder, fullPath).replace(/\\/g, '/')
-        folders.add(relativeFolder === '' ? '/' : relativeFolder)
-        await collectFilesRecursive(rootFolder, fullPath, control, collector, folders)
+      if (entry.isSymbolicLink()) {
+        // Ignore symlinks to avoid traversal loops.
         continue
       }
 
-      if (!isFile || shouldIgnoreFile(entry.name)) {
+      const isDirectory = entry.isDirectory()
+      const isFile = entry.isFile()
+
+      if (isDirectory) {
+        if (options.ignoreHidden !== false && shouldIgnoreDirectory(entry.name)) {
+          continue
+        }
+
+        const relativeFolder = path.relative(rootFolder, fullPath).replace(/\\/g, '/')
+        folders.add(relativeFolder === '' ? '/' : relativeFolder)
+        await collectFilesRecursive(rootFolder, fullPath, control, options, collector, folders, byExt)
+        continue
+      }
+
+      if (!isFile) {
+        continue
+      }
+
+      if (options.ignoreSystemFiles !== false && shouldIgnoreFile(entry.name)) {
         continue
       }
 
@@ -436,8 +454,9 @@ async function collectFilesRecursive(
       const parentRelativeRaw = path.dirname(relativePath).replace(/\\/g, '/')
       const parentRelativePath = parentRelativeRaw === '.' ? '/' : parentRelativeRaw
       const extension = path.extname(entry.name).toLowerCase()
-      const fileStats = stats ?? (await fs.promises.stat(fullPath))
+      const fileStats = await fs.promises.stat(fullPath)
       const sha256 = await hashFileSha256(fullPath, control)
+      byExt[extension || '(no_ext)'] = (byExt[extension || '(no_ext)'] ?? 0) + 1
 
       collector.push({
         absolutePath: fullPath,
@@ -459,29 +478,38 @@ async function collectFilesRecursive(
 
 function emptyIngestionPlan(rootFolder: string): IngestionPlan {
   return {
-    root: rootFolder,
+    root: path.basename(rootFolder),
+    rootPath: rootFolder,
     totalFiles: 0,
+    totalFolders: 0,
+    totalBytes: 0,
     totalSizeBytes: 0,
     foldersScanned: 0,
+    byExt: {},
     folders: [],
     files: []
   }
 }
 
-async function buildIngestionPlan(rootFolder: string, control: ScanControl): Promise<IngestionPlan> {
+async function buildIngestionPlan(rootFolder: string, control: ScanControl, options: ScanOptions): Promise<IngestionPlan> {
   const files: PlannedFile[] = []
   const folders = new Set<string>()
-  await collectFilesRecursive(rootFolder, rootFolder, control, files, folders)
+  const byExt: Record<string, number> = {}
+  await collectFilesRecursive(rootFolder, rootFolder, control, options, files, folders, byExt)
   ensureNotCancelled(control)
 
   const totalSizeBytes = files.reduce((sum, file) => sum + file.sizeBytes, 0)
   const normalizedFolders = Array.from(folders.values()).sort((a, b) => a.localeCompare(b))
 
   return {
-    root: rootFolder,
+    root: path.basename(rootFolder),
+    rootPath: rootFolder,
     totalFiles: files.length,
+    totalFolders: normalizedFolders.length + 1,
+    totalBytes: totalSizeBytes,
     totalSizeBytes,
     foldersScanned: normalizedFolders.length,
+    byExt,
     folders: normalizedFolders,
     files
   }
@@ -563,22 +591,41 @@ app.whenReady().then(() => {
   /**
    * Folder scan
    */
-  ipcMain.handle('scan-folder', async (_event, folderPath: string) => {
+  ipcMain.handle('scan-folder', async (_event, folderPath: string, options?: ScanOptions) => {
     const scanControl: ScanControl = { cancelled: false }
     activeScanControl = scanControl
 
+    const normalizedRoot = path.resolve(folderPath)
+    console.log('[ipc:scan-folder] requested', { folderPath, normalizedRoot, options })
+
     try {
-      const plan = await buildIngestionPlan(folderPath, scanControl)
+      const stats = await fs.promises.stat(normalizedRoot)
+      if (!stats.isDirectory()) {
+        throw new Error('Selected source path is not a directory.')
+      }
+
+      await fs.promises.access(normalizedRoot, fs.constants.R_OK)
+      const plan = await buildIngestionPlan(normalizedRoot, scanControl, {
+        ignoreHidden: options?.ignoreHidden ?? true,
+        ignoreSystemFiles: options?.ignoreSystemFiles ?? true
+      })
+      console.log('[ipc:scan-folder] complete', {
+        rootPath: plan.rootPath,
+        totalFiles: plan.totalFiles,
+        totalFolders: plan.totalFolders,
+        totalBytes: plan.totalBytes
+      })
       const result: ScanResult = {
         success: true,
         plan
       }
       return result
     } catch (error: unknown) {
+      console.error('[ipc:scan-folder] failed', { normalizedRoot, error: getErrorMessage(error) })
       const result: ScanResult = {
         success: false,
         error: getErrorMessage(error),
-        plan: emptyIngestionPlan(folderPath)
+        plan: emptyIngestionPlan(normalizedRoot)
       }
       return result
     } finally {

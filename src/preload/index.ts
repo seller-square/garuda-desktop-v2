@@ -1,33 +1,43 @@
 import { contextBridge } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
+function logInvoke(method: string, ...args: unknown[]) {
+  console.log(`[preload:${method}]`, ...args)
+}
+
 // Custom APIs for renderer (Garuda APIs)
 const api = {
   // Open native folder picker
   selectFolder: () => {
+    logInvoke('selectFolder')
     return electronAPI.ipcRenderer.invoke('select-folder')
   },
 
   // Scan a selected folder recursively
-  scanFolder: (folderPath: string) => {
-    return electronAPI.ipcRenderer.invoke('scan-folder', folderPath)
+  scanFolder: (folderPath: string, options?: { ignoreHidden?: boolean; ignoreSystemFiles?: boolean }) => {
+    logInvoke('scanFolder', { folderPath, options })
+    return electronAPI.ipcRenderer.invoke('scan-folder', folderPath, options)
   },
 
   validateFolderReadable: (candidatePath: string | null) => {
+    logInvoke('validateFolderReadable', { candidatePath })
     return electronAPI.ipcRenderer.invoke('validate-folder-readable', candidatePath)
   },
 
   cancelScanFolder: () => {
+    logInvoke('cancelScanFolder')
     return electronAPI.ipcRenderer.invoke('cancel-scan-folder')
   },
 
   dryRunStreamOpen: (items: Array<{ sourcePath: string; expectedSizeBytes: number }>) => {
+    logInvoke('dryRunStreamOpen', { count: items.length })
     return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
   },
 
   verifyDestinationPaths: (
     items: Array<{ filePath: string; expectedSizeBytes: number | null; expectedFilename: string | null }>
   ) => {
+    logInvoke('verifyDestinationPaths', { count: items.length })
     return electronAPI.ipcRenderer.invoke('verify-destination-paths', items)
   },
 
@@ -50,6 +60,7 @@ const api = {
       mimeType: string
     }>
   }) => {
+    logInvoke('executeFilesystemStreamPlan', { destinationRootPath: request.destinationRootPath, count: request.items.length })
     return electronAPI.ipcRenderer.invoke('execute-filesystem-stream-plan', request)
   }
 }

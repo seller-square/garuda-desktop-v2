@@ -13,11 +13,20 @@ declare global {
 
   type IngestionPlan = {
     root: string
+    rootPath: string
     totalFiles: number
+    totalFolders: number
+    totalBytes: number
     totalSizeBytes: number
     foldersScanned: number
+    byExt: Record<string, number>
     files: ScannedFile[]
     folders: string[]
+  }
+
+  type ScanOptions = {
+    ignoreHidden?: boolean
+    ignoreSystemFiles?: boolean
   }
 
   type ScanResult =
@@ -141,7 +150,7 @@ declare global {
   interface Window {
     api: {
       selectFolder: () => Promise<string | null>
-      scanFolder: (folderPath: string) => Promise<ScanResult>
+      scanFolder: (folderPath: string, options?: ScanOptions) => Promise<ScanResult>
       validateFolderReadable: (candidatePath: string | null) => Promise<FolderReadableValidation>
       cancelScanFolder: () => Promise<{ success: boolean }>
       dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
