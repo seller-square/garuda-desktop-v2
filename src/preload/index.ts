@@ -33,7 +33,7 @@ const api = {
     return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
   },
 
-  executeDriveUploadPlan: (
+  executeFilesystemStreamPlan: (
     items: Array<{
       sourcePath: string
       destinationFilename: string
@@ -43,7 +43,7 @@ const api = {
       mimeType: string
     }>
   ) => {
-    return electronAPI.ipcRenderer.invoke('execute-drive-upload-plan', items)
+    return electronAPI.ipcRenderer.invoke('execute-filesystem-stream-plan', items)
   }
 }
 

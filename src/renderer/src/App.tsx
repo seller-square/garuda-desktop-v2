@@ -987,7 +987,7 @@ function App() {
 
     try {
       const projectCode = selectedProject.project_code?.trim() || 'PROJECT'
-      const response = await window.api.executeDriveUploadPlan(
+      const response = await window.api.executeFilesystemStreamPlan(
         executionPlan.map((item) => ({
           sourcePath: item.sourcePath,
           destinationFilename: item.destinationFilename,
@@ -1001,7 +1001,7 @@ function App() {
       if (response.success) {
         setUploadResultMessage({
           kind: 'success',
-          text: `Uploaded ${response.uploadedCount} file(s) to Google Drive via streaming.`
+          text: `Streamed ${response.uploadedCount} file(s) to the Drive Desktop destination.`
         })
         return
       }
@@ -1013,7 +1013,7 @@ function App() {
     } catch (error: unknown) {
       setUploadResultMessage({
         kind: 'error',
-        text: error instanceof Error ? error.message : 'Drive upload failed.'
+        text: error instanceof Error ? error.message : 'Filesystem stream execution failed.'
       })
     } finally {
       setUploadRunning(false)
@@ -1539,7 +1539,7 @@ function App() {
                   disabled={!executionValidation?.executionReady || uploadRunning}
                   style={!executionValidation?.executionReady || uploadRunning ? styles.actionButtonDisabled : styles.actionButtonSecondary}
                 >
-                  {uploadRunning ? 'Uploading (Serial)...' : 'Execute Drive Upload'}
+                  {uploadRunning ? 'Streaming (Serial)...' : 'Execute Filesystem Stream'}
                 </button>
               </div>
 

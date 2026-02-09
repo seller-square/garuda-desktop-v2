@@ -78,7 +78,7 @@ declare global {
     results: DryRunFileResult[]
   }
 
-  type DriveExecutionUploadItem = {
+  type FilesystemExecutionUploadItem = {
     sourcePath: string
     destinationFilename: string
     projectCode: string
@@ -87,20 +87,19 @@ declare global {
     mimeType: string
   }
 
-  type DriveUploadResultItem = {
+  type FilesystemUploadResultItem = {
     sourcePath: string
     destinationFilename: string
-    fileId: string
-    driveFolderId: string
+    destinationPath: string
   }
 
-  type ExecuteDriveUploadResult =
-    | { success: true; uploadedCount: number; results: DriveUploadResultItem[] }
+  type ExecuteFilesystemStreamResult =
+    | { success: true; uploadedCount: number; results: FilesystemUploadResultItem[] }
     | {
         success: false
         uploadedCount: number
-        results: DriveUploadResultItem[]
-        failedItem: DriveExecutionUploadItem
+        results: FilesystemUploadResultItem[]
+        failedItem: FilesystemExecutionUploadItem
         error: string
       }
 
@@ -113,7 +112,7 @@ declare global {
       validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
       setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
       dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
-      executeDriveUploadPlan: (items: DriveExecutionUploadItem[]) => Promise<ExecuteDriveUploadResult>
+      executeFilesystemStreamPlan: (items: FilesystemExecutionUploadItem[]) => Promise<ExecuteFilesystemStreamResult>
     }
   }
 }
