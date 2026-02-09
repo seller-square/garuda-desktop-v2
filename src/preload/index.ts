@@ -13,6 +13,10 @@ const api = {
     return electronAPI.ipcRenderer.invoke('scan-folder', folderPath)
   },
 
+  validateFolderReadable: (candidatePath: string | null) => {
+    return electronAPI.ipcRenderer.invoke('validate-folder-readable', candidatePath)
+  },
+
   cancelScanFolder: () => {
     return electronAPI.ipcRenderer.invoke('cancel-scan-folder')
   },
@@ -29,6 +33,7 @@ const api = {
 
   executeFilesystemStreamPlan: (request: {
     accessToken: string
+    destinationRootPath: string
     items: Array<{
       projectId: string
       slotId: string

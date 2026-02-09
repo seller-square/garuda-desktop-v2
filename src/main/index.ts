@@ -19,14 +19,15 @@ type PlannedFile = {
   fileType: DetectedFileType
   sha256: string
   relativePath: string
-  size: number
+  sizeBytes: number
   extension: string
 }
 
 type IngestionPlan = {
   root: string
   totalFiles: number
-  totalSize: number
+  totalSizeBytes: number
+  foldersScanned: number
   folders: string[]
   files: PlannedFile[]
 }
@@ -34,17 +35,6 @@ type IngestionPlan = {
 type ScanResult =
   | { success: true; plan: IngestionPlan }
   | { success: false; error: string; plan: IngestionPlan }
-
-type DriveRootConfig = {
-  driveRootPath: string | null
-  updatedAt: string | null
-}
-
-type DrivePathValidation = {
-  valid: boolean
-  normalizedPath: string | null
-  error: string | null
-}
 
 type DryRunRequestItem = {
   sourcePath: string
@@ -133,6 +123,7 @@ type ExecuteUploadResult =
 
 type ExecutionRequest = {
   accessToken: string
+  destinationRootPath: string
   items: ExecutionUploadItem[]
 }
 
@@ -149,7 +140,6 @@ type ExecutionResult = {
   error?: string
 }
 
-const CONFIG_FILE_NAME = 'garuda-config.json'
 const HIDDEN_FOLDERS = new Set(['.git', 'node_modules'])
 const IMAGE_EXTENSIONS = new Set([
   '.jpg',
@@ -215,51 +205,15 @@ function getSupabaseExecutionClient(accessToken: string) {
   })
 }
 
-function getConfigPath(): string {
-  return join(app.getPath('userData'), CONFIG_FILE_NAME)
-}
-
-function readDriveRootConfig(): DriveRootConfig {
-  const configPath = getConfigPath()
-
-  if (!fs.existsSync(configPath)) {
-    return { driveRootPath: null, updatedAt: null }
+async function validateLocalDirectory(candidatePath: string): Promise<string> {
+  const normalizedPath = path.resolve(candidatePath.trim())
+  const stats = await fs.promises.stat(normalizedPath)
+  if (!stats.isDirectory()) {
+    throw new Error('Selected path is not a directory.')
   }
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8')) as Partial<DriveRootConfig>
-    return {
-      driveRootPath: typeof parsed.driveRootPath === 'string' ? parsed.driveRootPath : null,
-      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : null
-    }
-  } catch {
-    return { driveRootPath: null, updatedAt: null }
-  }
-}
-
-function validateDriveRootPath(candidatePath: string | null): DrivePathValidation {
-  if (!candidatePath || candidatePath.trim().length === 0) {
-    return { valid: false, normalizedPath: null, error: 'Drive root path is required.' }
-  }
-
-  try {
-    const normalizedPath = path.resolve(candidatePath.trim())
-    const stats = fs.statSync(normalizedPath)
-
-    if (!stats.isDirectory()) {
-      return { valid: false, normalizedPath: null, error: 'Selected path is not a directory.' }
-    }
-
-    fs.accessSync(normalizedPath, fs.constants.R_OK | fs.constants.W_OK)
-
-    return { valid: true, normalizedPath, error: null }
-  } catch (error: unknown) {
-    return {
-      valid: false,
-      normalizedPath: null,
-      error: `Invalid path: ${getErrorMessage(error)}`
-    }
-  }
+  await fs.promises.access(normalizedPath, fs.constants.R_OK | fs.constants.W_OK)
+  return normalizedPath
 }
 
 function classifyFsError(error: unknown): DryRunErrorType {
@@ -293,38 +247,15 @@ function probeReadStream(sourcePath: string): Promise<void> {
   })
 }
 
-function resolveDriveUriToLocalPath(filePath: string, driveRootPath: string): string {
-  if (!filePath.startsWith('drive://')) {
-    throw new Error(`Unsupported file path scheme: ${filePath}`)
-  }
-
-  const relativePath = filePath.replace(/^drive:\/\//, '')
-  return path.join(driveRootPath, relativePath)
-}
-
 class FilesystemStreamingAdapter {
-  private readonly driveRootPath: string
+  private readonly destinationRootPath: string
 
-  constructor(driveRootPath: string) {
-    this.driveRootPath = driveRootPath
-  }
-
-  static createFromLocalConfig(): FilesystemStreamingAdapter {
-    const config = readDriveRootConfig()
-    if (!config.driveRootPath) {
-      throw new Error('Drive root path is not configured. Set it in Settings first.')
-    }
-
-    const validation = validateDriveRootPath(config.driveRootPath)
-    if (!validation.valid || !validation.normalizedPath) {
-      throw new Error(validation.error ?? 'Drive root path is invalid.')
-    }
-
-    return new FilesystemStreamingAdapter(validation.normalizedPath)
+  constructor(destinationRootPath: string) {
+    this.destinationRootPath = destinationRootPath
   }
 
   private resolveDestinationDir(projectCode: string, assetKind: string, slotCode: string): string {
-    return path.join(this.driveRootPath, projectCode, 'source', assetKind, slotCode)
+    return path.join(this.destinationRootPath, projectCode, 'source', assetKind, slotCode)
   }
 
   async uploadStream(item: ExecutionUploadItem): Promise<StreamedFileWriteResult> {
@@ -515,7 +446,7 @@ async function collectFilesRecursive(
         filename: entry.name,
         relativePath,
         parentRelativePath,
-        size: fileStats.size,
+        sizeBytes: fileStats.size,
         extension,
         fileType: detectFileType(extension),
         sha256
@@ -530,7 +461,8 @@ function emptyIngestionPlan(rootFolder: string): IngestionPlan {
   return {
     root: rootFolder,
     totalFiles: 0,
-    totalSize: 0,
+    totalSizeBytes: 0,
+    foldersScanned: 0,
     folders: [],
     files: []
   }
@@ -542,13 +474,14 @@ async function buildIngestionPlan(rootFolder: string, control: ScanControl): Pro
   await collectFilesRecursive(rootFolder, rootFolder, control, files, folders)
   ensureNotCancelled(control)
 
-  const totalSize = files.reduce((sum, file) => sum + file.size, 0)
+  const totalSizeBytes = files.reduce((sum, file) => sum + file.sizeBytes, 0)
   const normalizedFolders = Array.from(folders.values()).sort((a, b) => a.localeCompare(b))
 
   return {
     root: rootFolder,
     totalFiles: files.length,
-    totalSize,
+    totalSizeBytes,
+    foldersScanned: normalizedFolders.length,
     folders: normalizedFolders,
     files
   }
@@ -606,6 +539,25 @@ app.whenReady().then(() => {
     }
 
     return result.filePaths[0]
+  })
+
+  ipcMain.handle('validate-folder-readable', async (_event, candidatePath: string | null) => {
+    if (!candidatePath || candidatePath.trim().length === 0) {
+      return { valid: false, normalizedPath: null, error: 'Path is required.' }
+    }
+
+    try {
+      const normalizedPath = path.resolve(candidatePath.trim())
+      const stats = await fs.promises.stat(normalizedPath)
+      if (!stats.isDirectory()) {
+        return { valid: false, normalizedPath: null, error: 'Selected path is not a directory.' }
+      }
+
+      await fs.promises.access(normalizedPath, fs.constants.R_OK)
+      return { valid: true, normalizedPath, error: null }
+    } catch (error: unknown) {
+      return { valid: false, normalizedPath: null, error: getErrorMessage(error) }
+    }
   })
 
   /**
@@ -717,22 +669,15 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('verify-destination-paths', async (_event, items: VerifyDestinationRequestItem[]) => {
-    const config = readDriveRootConfig()
-    if (!config.driveRootPath) {
-      throw new Error('Drive root path is not configured. Set it in Settings first.')
-    }
-
-    const validation = validateDriveRootPath(config.driveRootPath)
-    if (!validation.valid || !validation.normalizedPath) {
-      throw new Error(validation.error ?? 'Drive root path is invalid.')
-    }
-
-    const driveRootPath = validation.normalizedPath
     const results: VerifyDestinationResultItem[] = []
 
     for (const item of items) {
       try {
-        const localPath = resolveDriveUriToLocalPath(item.filePath, driveRootPath)
+        if (!item.filePath || item.filePath.startsWith('local://')) {
+          throw new Error('Destination file path is not a local filesystem path.')
+        }
+
+        const localPath = path.resolve(item.filePath)
         const stats = await fs.promises.stat(localPath)
 
         const expectedFilename = item.expectedFilename ?? path.basename(item.filePath)
@@ -749,13 +694,7 @@ app.whenReady().then(() => {
           error: null
         })
       } catch (error: unknown) {
-        const localPath = (() => {
-          try {
-            return resolveDriveUriToLocalPath(item.filePath, driveRootPath)
-          } catch {
-            return ''
-          }
-        })()
+        const localPath = item.filePath ? path.resolve(item.filePath) : ''
 
         results.push({
           filePath: item.filePath,
@@ -776,8 +715,9 @@ app.whenReady().then(() => {
   })
 
   ipcMain.handle('execute-filesystem-stream-plan', async (_event, payload: ExecutionRequest): Promise<ExecuteUploadResult> => {
-    const { accessToken, items } = payload
-    const adapter = FilesystemStreamingAdapter.createFromLocalConfig()
+    const { accessToken, destinationRootPath, items } = payload
+    const normalizedDestinationRoot = await validateLocalDirectory(destinationRootPath)
+    const adapter = new FilesystemStreamingAdapter(normalizedDestinationRoot)
     const supabaseClient = getSupabaseExecutionClient(accessToken)
     const results: UploadResultItem[] = []
     const executionResults: ExecutionResult[] = []

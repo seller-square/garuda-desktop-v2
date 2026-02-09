@@ -351,7 +351,12 @@ function normalizeIngestionPlan(plan: unknown): IngestionPlan {
           : relativePath.includes('/')
             ? relativePath.split('/').slice(0, -1).join('/') || '/'
             : '/'
-      const size = typeof file.size === 'number' && Number.isFinite(file.size) ? file.size : 0
+      const size =
+        typeof file.size === 'number' && Number.isFinite(file.size)
+          ? file.size
+          : typeof file.sizeBytes === 'number' && Number.isFinite(file.sizeBytes)
+            ? file.sizeBytes
+            : 0
       const fileType =
         file.fileType === 'image' || file.fileType === 'video' || file.fileType === 'other'
           ? file.fileType
@@ -416,6 +421,8 @@ function normalizeIngestionPlan(plan: unknown): IngestionPlan {
     totalBytes:
       typeof record.totalBytes === 'number' && Number.isFinite(record.totalBytes)
         ? record.totalBytes
+        : typeof record.totalSizeBytes === 'number' && Number.isFinite(record.totalSizeBytes)
+          ? record.totalSizeBytes
         : typeof record.totalSize === 'number' && Number.isFinite(record.totalSize)
           ? record.totalSize
           : computedBytes,
@@ -672,6 +679,11 @@ function App() {
   const [activeTab, setActiveTab] = useState<DashboardTab>('scan')
 
   const [folderPath, setFolderPath] = useState<string | null>(null)
+  const [sourcePathValidation, setSourcePathValidation] = useState<FolderReadableValidation>({
+    valid: false,
+    normalizedPath: null,
+    error: null
+  })
   const [destinationPath, setDestinationPath] = useState<string | null>(null)
   const [destinationPathWarning, setDestinationPathWarning] = useState<string | null>(null)
   const [scanResult, setScanResult] = useState<ScanResult>({ success: true, plan: EMPTY_INGESTION_PLAN })
@@ -1070,6 +1082,13 @@ function App() {
     }
   }, [folderSlotAssignments, scanResult, selectedProject?.project_code, selectedSlotId, slotById, slotNamingOverrides])
 
+  const safeScanPlan = useMemo(() => {
+    if (!scanResult.success) {
+      return EMPTY_INGESTION_PLAN
+    }
+    return normalizeIngestionPlan(scanResult.plan)
+  }, [scanResult])
+
   const executionPlan = useMemo<ExecutionPlanItem[]>(() => {
     if (!mappingPlan || !selectedProject) {
       return []
@@ -1312,8 +1331,39 @@ function App() {
   }, [session])
 
   useEffect(() => {
+    if (!folderPath) {
+      setSourcePathValidation({
+        valid: false,
+        normalizedPath: null,
+        error: null
+      })
+      return
+    }
+
+    let isActive = true
+    window.api
+      .validateFolderReadable(folderPath)
+      .then((validation) => {
+        if (!isActive) return
+        setSourcePathValidation(validation)
+      })
+      .catch((error: unknown) => {
+        if (!isActive) return
+        setSourcePathValidation({
+          valid: false,
+          normalizedPath: null,
+          error: error instanceof Error ? error.message : 'Failed to validate source folder.'
+        })
+      })
+
+    return () => {
+      isActive = false
+    }
+  }, [folderPath])
+
+  useEffect(() => {
     if (activeTab !== 'execution') return
-    if (!selectedProject || executionPlan.length === 0) return
+    if (!selectedProject || executionPlan.length === 0 || !destinationPath) return
 
     const key = `${selectedProject.id}:${executionPlan.length}`
     if (autoPreflightDoneKey === key) {
@@ -1327,7 +1377,7 @@ function App() {
         text: error instanceof Error ? error.message : 'Failed to auto-run execution preflight.'
       })
     })
-  }, [activeTab, autoPreflightDoneKey, executionPlan.length, selectedProject])
+  }, [activeTab, autoPreflightDoneKey, destinationPath, executionPlan.length, selectedProject])
 
   useEffect(() => {
     if (!selectedProjectId) {
@@ -1367,10 +1417,17 @@ function App() {
   }, [selectedProjectId])
 
   const handleSelectFolder = async () => {
-    const path = await window.api.selectFolder()
-    setFolderPath(path)
-    setDestinationPath(null)
-    setDestinationPathWarning(null)
+    const selectedPath = await window.api.selectFolder()
+    if (!selectedPath) {
+      return
+    }
+
+    setFolderPath(selectedPath)
+    if (destinationPath && normalizeLocalPath(selectedPath) === normalizeLocalPath(destinationPath)) {
+      setDestinationPathWarning('Source and destination folders cannot be the same path.')
+    } else {
+      setDestinationPathWarning(null)
+    }
     setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
     setScanHasRun(false)
     setFolderSlotAssignments({})
@@ -1385,10 +1442,8 @@ function App() {
   }
 
   const handleScan = async () => {
-    if (!folderPath) return
+    if (!folderPath || !sourcePathValidation.valid || !sourcePathValidation.normalizedPath) return
     setScanning(true)
-    setDestinationPath(null)
-    setDestinationPathWarning(null)
     setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
     setScanHasRun(false)
     setFolderSlotAssignments({})
@@ -1401,7 +1456,7 @@ function App() {
     setResumeNotice(null)
     setAutoPreflightDoneKey(null)
     try {
-      const result = await window.api.scanFolder(folderPath)
+      const result = await window.api.scanFolder(sourcePathValidation.normalizedPath)
       if (result && typeof result === 'object' && 'success' in result) {
         if (result.success) {
           const normalizedPlan = normalizeIngestionPlan(result.plan)
@@ -1409,18 +1464,6 @@ function App() {
             success: true,
             plan: normalizedPlan
           })
-
-          const selectedDestination = await window.api.selectFolder()
-          if (selectedDestination) {
-            if (normalizeLocalPath(folderPath) === normalizeLocalPath(selectedDestination)) {
-              setDestinationPath(null)
-              setDestinationPathWarning('Source and destination folders cannot be the same path.')
-            } else {
-              setDestinationPath(selectedDestination)
-            }
-          } else {
-            setDestinationPathWarning('Destination folder not selected yet.')
-          }
         } else {
           setScanResult({
             success: false,
@@ -1729,7 +1772,11 @@ function App() {
   }
 
   const handleRunVerification = async () => {
-    if (!selectedProject) {
+    if (!selectedProject || !destinationPath) {
+      setUploadResultMessage({
+        kind: 'error',
+        text: 'Select a destination folder before verification.'
+      })
       return
     }
 
@@ -1767,7 +1814,7 @@ function App() {
   }
 
   const handleExecuteUpload = async () => {
-    if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject || !session) {
+    if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject || !session || !destinationPath) {
       return
     }
 
@@ -1798,6 +1845,7 @@ function App() {
       const pendingItems = executionPlan.filter((item) => pendingShaSet.has(item.sha256))
       const response = await window.api.executeFilesystemStreamPlan({
         accessToken: session.access_token,
+        destinationRootPath: destinationPath,
         items: pendingItems.map((item) => ({
           projectId: item.projectId,
           slotId: item.slotId,
@@ -1843,13 +1891,12 @@ function App() {
     const selectedPath = await window.api.selectFolder()
     if (!selectedPath) return
 
-    setDestinationPath(selectedPath)
     if (folderPath && normalizeLocalPath(folderPath) === normalizeLocalPath(selectedPath)) {
-      setDestinationPath(null)
       setDestinationPathWarning('Source and destination folders cannot be the same path.')
       return
     }
 
+    setDestinationPath(selectedPath)
     setDestinationPathWarning(null)
   }
 
@@ -2438,8 +2485,8 @@ function App() {
 
                 <button
                   onClick={handleScan}
-                  disabled={!folderPath || scanning}
-                  style={scanning ? styles.actionButtonDisabled : styles.actionButtonPrimary}
+                  disabled={!folderPath || !sourcePathValidation.valid || scanning}
+                  style={!folderPath || !sourcePathValidation.valid || scanning ? styles.actionButtonDisabled : styles.actionButtonPrimary}
                 >
                   {scanning ? <Loader2 size={16} /> : <Scan size={16} />}
                   {scanning ? 'Scanning...' : 'Scan Folder'}
@@ -2453,6 +2500,9 @@ function App() {
               </div>
 
               {folderPath && <div style={styles.pathText}>Selected: {folderPath}</div>}
+              {folderPath && sourcePathValidation.error && (
+                <div style={styles.errorBanner}>Source folder is not readable: {sourcePathValidation.error}</div>
+              )}
               {destinationPath && <div style={styles.pathText}>Destination: {destinationPath}</div>}
               {!destinationPath && scanHasRun && scanResult.success && (
                 <div style={styles.mutedPanel}>Select a destination folder for the next execution phase.</div>
@@ -2476,16 +2526,15 @@ function App() {
 
               {scanHasRun && scanResult.success && (
                 <div style={styles.resultPanel}>
-                  <strong>{normalizeIngestionPlan(scanResult.plan).totalFiles} files found</strong>
+                  <strong>{safeScanPlan.totalFiles} files found</strong>
                   <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 6 }}>
-                    Root: {normalizeIngestionPlan(scanResult.plan).rootFolder}
+                    Root: {safeScanPlan.rootFolder}
                   </div>
                   <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4 }}>
-                    Total size: {formatBytes(normalizeIngestionPlan(scanResult.plan).totalBytes)} · Folders:{' '}
-                    {normalizeIngestionPlan(scanResult.plan).folderGroups.length}
+                    Total size: {formatBytes(safeScanPlan.totalBytes)} · Folders: {safeScanPlan.folderGroups.length}
                   </div>
                   <div style={{ marginTop: 12, maxHeight: 300, overflowY: 'auto' }}>
-                    {normalizeIngestionPlan(scanResult.plan).folderGroups.map((group) => (
+                    {safeScanPlan.folderGroups.map((group) => (
                       <div key={group.relativePath} style={styles.fileRow}>
                         <span>{group.relativePath}</span>
                         <span style={{ color: '#64748b' }}>
@@ -2520,7 +2569,7 @@ function App() {
                   </div>
 
                   <div style={styles.mappingGridBody}>
-                    {normalizeIngestionPlan(scanResult.plan).folderGroups.map((group) => (
+                    {safeScanPlan.folderGroups.map((group) => (
                       <div key={group.relativePath} style={styles.mappingGridRow}>
                         <span style={styles.mappingFolderCell}>{group.relativePath}</span>
                         <span style={styles.mappingFileCell}>
@@ -2696,15 +2745,23 @@ function App() {
               <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
                 <button
                   onClick={handleRunExecutionDryRun}
-                  disabled={executionRunning || executionPlan.length === 0}
-                  style={executionRunning || executionPlan.length === 0 ? styles.actionButtonDisabled : styles.actionButtonPrimary}
+                  disabled={executionRunning || executionPlan.length === 0 || !destinationPath}
+                  style={
+                    executionRunning || executionPlan.length === 0 || !destinationPath
+                      ? styles.actionButtonDisabled
+                      : styles.actionButtonPrimary
+                  }
                 >
                   {executionRunning ? 'Running Dry Run...' : 'Run Streaming Dry Run'}
                 </button>
                 <button
                   onClick={() => handleRunExecutionPreflight()}
-                  disabled={preflightLoading || executionPlan.length === 0}
-                  style={preflightLoading || executionPlan.length === 0 ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                  disabled={preflightLoading || executionPlan.length === 0 || !destinationPath}
+                  style={
+                    preflightLoading || executionPlan.length === 0 || !destinationPath
+                      ? styles.actionButtonDisabled
+                      : styles.actionButtonSecondary
+                  }
                 >
                   {preflightLoading ? 'Preflight...' : 'Run Resume Preflight'}
                 </button>
@@ -2714,6 +2771,7 @@ function App() {
                     !executionValidation?.executionReady ||
                     uploadRunning ||
                     !session ||
+                    !destinationPath ||
                     !executionPreflight ||
                     executionPreflight.missingUnreadableCount > 0
                   }
@@ -2721,6 +2779,7 @@ function App() {
                     !executionValidation?.executionReady ||
                     uploadRunning ||
                     !session ||
+                    !destinationPath ||
                     !executionPreflight ||
                     executionPreflight.missingUnreadableCount > 0
                       ? styles.actionButtonDisabled
@@ -2731,8 +2790,12 @@ function App() {
                 </button>
                 <button
                   onClick={() => handleRunVerification()}
-                  disabled={verificationRunning || !selectedProject}
-                  style={verificationRunning || !selectedProject ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                  disabled={verificationRunning || !selectedProject || !destinationPath}
+                  style={
+                    verificationRunning || !selectedProject || !destinationPath
+                      ? styles.actionButtonDisabled
+                      : styles.actionButtonSecondary
+                  }
                 >
                   {verificationRunning ? 'Verifying...' : 'Verify Destination'}
                 </button>

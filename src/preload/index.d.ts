@@ -5,13 +5,14 @@ type ScannedFile = {
   relativePath: string
   filename: string
   extension: string
-  size: number
+  sizeBytes: number
 }
 
 type IngestionPlan = {
   root: string
   totalFiles: number
-  totalSize: number
+  totalSizeBytes: number
+  foldersScanned: number
   folders: string[]
   files: ScannedFile[]
 }
@@ -124,12 +125,20 @@ type ExecuteFilesystemStreamResult =
 
 type ExecuteFilesystemStreamRequest = {
   accessToken: string
+  destinationRootPath: string
   items: FilesystemExecutionUploadItem[]
+}
+
+type FolderReadableValidation = {
+  valid: boolean
+  normalizedPath: string | null
+  error: string | null
 }
 
 interface GarudaApi {
   selectFolder: () => Promise<string | null>
   scanFolder: (folderPath: string) => Promise<ScanResult>
+  validateFolderReadable: (candidatePath: string | null) => Promise<FolderReadableValidation>
   cancelScanFolder: () => Promise<{ success: boolean }>
   dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
   verifyDestinationPaths: (items: VerifyDestinationRequestItem[]) => Promise<VerifyDestinationResult>
