@@ -48,10 +48,29 @@ type SlotMappingSummary = {
   plannedFiles: ScannedFile[]
 }
 
+type SlotNamingConfig = {
+  slotId: string
+  slotLabel: string
+  prefix: string
+  padding: number
+}
+
+type RenamePlanItem = {
+  slotId: string
+  slotLabel: string
+  oldFilename: string
+  oldRelativePath: string
+  plannedName: string
+  plannedSequence: number
+  plannedFilename: string
+}
+
 type MappingValidation = {
   fileTypeMismatches: string[]
   emptySlots: string[]
   duplicateHashes: Array<{ sha256: string; paths: string[] }>
+  renameCollisions: Array<{ plannedFilename: string; oldPaths: string[] }>
+  invalidNames: Array<{ oldPath: string; plannedFilename: string; reason: string }>
 }
 
 type MappingPlan = {
@@ -59,7 +78,14 @@ type MappingPlan = {
   totalFolderCount: number
   unmappedFolders: string[]
   slotSummaries: SlotMappingSummary[]
+  slotNamingConfigs: SlotNamingConfig[]
+  renamePlan: RenamePlanItem[]
   validation: MappingValidation
+}
+
+type SlotNamingOverride = {
+  prefix: string
+  padding: number
 }
 
 type ScanResult =
@@ -148,6 +174,19 @@ function normalizeSlotCode(rawLabel: string): string {
     .replace(/[^A-Z0-9_]/g, '')
 }
 
+function sanitizeFilenameToken(token: string): string {
+  return token
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/\s+/g, '_')
+}
+
+function getDefaultSlotPrefix(projectCode: string, slotLabel: string): string {
+  const sanitizedProjectCode = sanitizeFilenameToken(projectCode)
+  const sanitizedSlotLabel = sanitizeFilenameToken(slotLabel)
+  return sanitizeFilenameToken(`${sanitizedProjectCode}_${sanitizedSlotLabel}`)
+}
+
 function buildSlotNameFromFolderPath(folderRelativePath: string): string {
   if (folderRelativePath === '/') {
     return 'ROOT'
@@ -211,6 +250,7 @@ function App() {
   const [driveRootSaving, setDriveRootSaving] = useState(false)
   const [driveRootMessage, setDriveRootMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
   const [folderSlotAssignments, setFolderSlotAssignments] = useState<Record<string, string>>({})
+  const [slotNamingOverrides, setSlotNamingOverrides] = useState<Record<string, SlotNamingOverride>>({})
   const [mappingMessage, setMappingMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
   const [creatingSlotForFolder, setCreatingSlotForFolder] = useState<string | null>(null)
 
@@ -295,6 +335,21 @@ function App() {
     }
 
     const slotSummaries = Array.from(slotSummariesMap.values()).sort((a, b) => a.slotLabel.localeCompare(b.slotLabel))
+    const projectCodeForPrefix = selectedProject?.project_code ?? 'PROJECT'
+    const slotNamingConfigs: SlotNamingConfig[] = slotSummaries.map((summary) => {
+      const override = slotNamingOverrides[summary.slotId]
+      const defaultPrefix = getDefaultSlotPrefix(projectCodeForPrefix, summary.slotLabel)
+      return {
+        slotId: summary.slotId,
+        slotLabel: summary.slotLabel,
+        prefix: override?.prefix ? sanitizeFilenameToken(override.prefix) : defaultPrefix,
+        padding: override?.padding ?? 4
+      }
+    })
+
+    const namingConfigBySlotId = new Map<string, SlotNamingConfig>(
+      slotNamingConfigs.map((config) => [config.slotId, config] as const)
+    )
     const mappedFolderCount = Object.keys(folderSlotAssignments).filter((folder) =>
       scanResult.plan.folderGroups.some((group) => group.relativePath === folder)
     ).length
@@ -345,18 +400,90 @@ function App() {
       .filter(([, paths]) => paths.length > 1)
       .map(([sha256, paths]) => ({ sha256, paths }))
 
+    const renamePlan: RenamePlanItem[] = []
+
+    for (const summary of slotSummaries) {
+      const naming = namingConfigBySlotId.get(summary.slotId)
+      if (!naming) {
+        continue
+      }
+
+      const files = [...summary.plannedFiles].sort((a, b) => a.relativePath.localeCompare(b.relativePath))
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index]
+        const plannedSequence = index + 1
+        const sequenceText = String(plannedSequence).padStart(naming.padding, '0')
+        const plannedName = `${naming.prefix}_${sequenceText}`
+        const plannedFilename = `${plannedName}${file.extension}`
+
+        renamePlan.push({
+          slotId: summary.slotId,
+          slotLabel: summary.slotLabel,
+          oldFilename: file.name,
+          oldRelativePath: file.relativePath,
+          plannedName,
+          plannedSequence,
+          plannedFilename
+        })
+      }
+    }
+
+    const plannedFilenameMap = new Map<string, string[]>()
+    const invalidNames: Array<{ oldPath: string; plannedFilename: string; reason: string }> = []
+
+    for (const item of renamePlan) {
+      if (!item.plannedName.trim()) {
+        invalidNames.push({
+          oldPath: item.oldRelativePath,
+          plannedFilename: item.plannedFilename,
+          reason: 'Planned base name is empty.'
+        })
+      }
+
+      if (/[<>:"/\\|?*\x00-\x1f]/.test(item.plannedFilename)) {
+        invalidNames.push({
+          oldPath: item.oldRelativePath,
+          plannedFilename: item.plannedFilename,
+          reason: 'Filename contains invalid characters.'
+        })
+      }
+
+      if (item.plannedFilename.length > 255) {
+        invalidNames.push({
+          oldPath: item.oldRelativePath,
+          plannedFilename: item.plannedFilename,
+          reason: 'Filename is longer than 255 characters.'
+        })
+      }
+
+      const existing = plannedFilenameMap.get(item.plannedFilename)
+      if (existing) {
+        existing.push(item.oldRelativePath)
+      } else {
+        plannedFilenameMap.set(item.plannedFilename, [item.oldRelativePath])
+      }
+    }
+
+    const renameCollisions = Array.from(plannedFilenameMap.entries())
+      .filter(([, oldPaths]) => oldPaths.length > 1)
+      .map(([plannedFilename, oldPaths]) => ({ plannedFilename, oldPaths }))
+
     return {
       mappedFolderCount,
       totalFolderCount: scanResult.plan.folderGroups.length,
       unmappedFolders,
       slotSummaries,
+      slotNamingConfigs,
+      renamePlan,
       validation: {
         fileTypeMismatches,
         emptySlots,
-        duplicateHashes
+        duplicateHashes,
+        renameCollisions,
+        invalidNames
       }
     }
-  }, [folderSlotAssignments, scanResult, slotById])
+  }, [folderSlotAssignments, scanResult, selectedProject?.project_code, selectedSlotId, slotById, slotNamingOverrides])
 
   const loadProjects = async (opts?: { keepSelection?: boolean }) => {
     setProjectsLoading(true)
@@ -512,6 +639,7 @@ function App() {
       setSlots([])
       setSelectedSlotId(null)
       setFolderSlotAssignments({})
+      setSlotNamingOverrides({})
       return
     }
 
@@ -525,6 +653,7 @@ function App() {
     setFolderPath(path)
     setScanResult(null)
     setFolderSlotAssignments({})
+    setSlotNamingOverrides({})
     setMappingMessage(null)
   }
 
@@ -533,6 +662,7 @@ function App() {
     setScanning(true)
     setScanResult(null)
     setFolderSlotAssignments({})
+    setSlotNamingOverrides({})
     setMappingMessage(null)
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
@@ -556,6 +686,29 @@ function App() {
         [folderRelativePath]: slotId
       }
     })
+  }
+
+  const handleSlotPrefixOverride = (slotId: string, prefix: string) => {
+    setSlotNamingOverrides((current) => ({
+      ...current,
+      [slotId]: {
+        prefix,
+        padding: current[slotId]?.padding ?? 4
+      }
+    }))
+  }
+
+  const handleSlotPaddingOverride = (slotId: string, rawPadding: string) => {
+    const parsed = Number.parseInt(rawPadding, 10)
+    const padding = Number.isFinite(parsed) ? Math.min(8, Math.max(1, parsed)) : 4
+
+    setSlotNamingOverrides((current) => ({
+      ...current,
+      [slotId]: {
+        prefix: current[slotId]?.prefix ?? '',
+        padding
+      }
+    }))
   }
 
   const handleCreateSlotFromFolder = async (folderRelativePath: string) => {
@@ -982,7 +1135,9 @@ function App() {
 
                       {(mappingPlan.validation.fileTypeMismatches.length > 0 ||
                         mappingPlan.validation.emptySlots.length > 0 ||
-                        mappingPlan.validation.duplicateHashes.length > 0) && (
+                        mappingPlan.validation.duplicateHashes.length > 0 ||
+                        mappingPlan.validation.renameCollisions.length > 0 ||
+                        mappingPlan.validation.invalidNames.length > 0) && (
                         <div style={styles.mappingValidationPanel}>
                           {mappingPlan.validation.fileTypeMismatches.map((issue) => (
                             <div key={issue} style={styles.mappingWarning}>
@@ -1001,8 +1156,86 @@ function App() {
                               Duplicate hash {duplicate.sha256.slice(0, 12)}... across: {duplicate.paths.join(', ')}
                             </div>
                           ))}
+
+                          {mappingPlan.validation.renameCollisions.map((duplicate) => (
+                            <div key={duplicate.plannedFilename} style={styles.mappingWarning}>
+                              Rename collision "{duplicate.plannedFilename}" for: {duplicate.oldPaths.join(', ')}
+                            </div>
+                          ))}
+
+                          {mappingPlan.validation.invalidNames.map((invalid) => (
+                            <div key={`${invalid.oldPath}-${invalid.plannedFilename}`} style={styles.mappingWarning}>
+                              Invalid rename "{invalid.plannedFilename}" for {invalid.oldPath}: {invalid.reason}
+                            </div>
+                          ))}
                         </div>
                       )}
+                    </div>
+                  )}
+
+                  {mappingPlan && mappingPlan.slotNamingConfigs.length > 0 && (
+                    <div style={styles.mappingSummaryPanel}>
+                      <h4 style={styles.mappingSummaryTitle}>Slot Naming Config</h4>
+                      <div style={styles.namingGridHeader}>
+                        <span>Slot</span>
+                        <span>Prefix</span>
+                        <span>Padding</span>
+                      </div>
+                      <div style={styles.namingGridBody}>
+                        {mappingPlan.slotNamingConfigs.map((config) => (
+                          <div key={config.slotId} style={styles.namingGridRow}>
+                            <span style={styles.mappingFolderCell}>{config.slotLabel}</span>
+                            <input
+                              value={slotNamingOverrides[config.slotId]?.prefix ?? config.prefix}
+                              onChange={(event) => handleSlotPrefixOverride(config.slotId, event.target.value)}
+                              style={styles.namingInput}
+                            />
+                            <input
+                              type="number"
+                              min={1}
+                              max={8}
+                              value={slotNamingOverrides[config.slotId]?.padding ?? config.padding}
+                              onChange={(event) => handleSlotPaddingOverride(config.slotId, event.target.value)}
+                              style={styles.namingPaddingInput}
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {mappingPlan && (
+                    <div style={styles.mappingSummaryPanel}>
+                      <h4 style={styles.mappingSummaryTitle}>Rename Preview</h4>
+                      <div style={styles.mappingSummaryText}>
+                        Deterministic preview only. No filesystem changes are performed in this phase.
+                      </div>
+                      <div style={styles.renameGridHeader}>
+                        <span>Slot</span>
+                        <span>Old Filename</span>
+                        <span>Planned Filename</span>
+                      </div>
+                      <div style={styles.renameGridBody}>
+                        {mappingPlan.renamePlan.map((item) => {
+                          const hasCollision = mappingPlan.validation.renameCollisions.some(
+                            (collision) => collision.plannedFilename === item.plannedFilename
+                          )
+                          const hasInvalid = mappingPlan.validation.invalidNames.some(
+                            (invalid) =>
+                              invalid.oldPath === item.oldRelativePath && invalid.plannedFilename === item.plannedFilename
+                          )
+
+                          return (
+                            <div key={`${item.slotId}-${item.oldRelativePath}`} style={styles.renameGridRow}>
+                              <span style={styles.mappingFileCell}>{item.slotLabel}</span>
+                              <span style={styles.mappingFolderCell}>{item.oldFilename}</span>
+                              <span style={hasCollision || hasInvalid ? styles.renameDangerCell : styles.renameOkCell}>
+                                {item.plannedFilename}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
                     </div>
                   )}
                 </>
@@ -1497,6 +1730,78 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid rgba(239, 68, 68, 0.25)',
     borderRadius: 6,
     padding: '6px 8px'
+  },
+  namingGridHeader: {
+    marginTop: 8,
+    display: 'grid',
+    gridTemplateColumns: '1.2fr 2fr 120px',
+    gap: 10,
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: 600,
+    borderBottom: '1px solid #1e293b',
+    paddingBottom: 8
+  },
+  namingGridBody: {
+    display: 'grid',
+    gap: 8,
+    marginTop: 8
+  },
+  namingGridRow: {
+    display: 'grid',
+    gridTemplateColumns: '1.2fr 2fr 120px',
+    gap: 10,
+    alignItems: 'center'
+  },
+  namingInput: {
+    borderRadius: 8,
+    border: '1px solid #334155',
+    background: '#020617',
+    color: 'white',
+    fontSize: 12,
+    padding: '8px 10px'
+  },
+  namingPaddingInput: {
+    borderRadius: 8,
+    border: '1px solid #334155',
+    background: '#020617',
+    color: 'white',
+    fontSize: 12,
+    padding: '8px 10px'
+  },
+  renameGridHeader: {
+    marginTop: 8,
+    display: 'grid',
+    gridTemplateColumns: '1fr 1.5fr 1.8fr',
+    gap: 10,
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: 600,
+    borderBottom: '1px solid #1e293b',
+    paddingBottom: 8
+  },
+  renameGridBody: {
+    display: 'grid',
+    gap: 8,
+    marginTop: 8,
+    maxHeight: 360,
+    overflowY: 'auto'
+  },
+  renameGridRow: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1.5fr 1.8fr',
+    gap: 10,
+    alignItems: 'center',
+    borderBottom: '1px solid #1e293b',
+    paddingBottom: 8
+  },
+  renameOkCell: {
+    fontSize: 12,
+    color: '#6ee7b7'
+  },
+  renameDangerCell: {
+    fontSize: 12,
+    color: '#fca5a5'
   },
   fileRow: {
     fontSize: 13,
