@@ -191,7 +191,7 @@ type ProjectListItem = {
   project_uploads?: Array<{ created_at: string | null }> | null
 }
 
-type DashboardTab = 'scan' | 'plan' | 'execution' | 'settings'
+type DashboardTab = 'scan' | 'plan' | 'execution'
 type BucketCode = 'IMG' | 'VID' | 'AUD' | 'MUS' | 'TRN' | 'BTS'
 type WizardStep = 1 | 2 | 3 | 4
 type SlotStructureMode = 'flat' | 'subfolders'
@@ -246,6 +246,8 @@ const BUCKETS: Array<{ code: BucketCode; label: string }> = [
   { code: 'TRN', label: 'Transcript' },
   { code: 'BTS', label: 'Behind the Scenes' }
 ]
+const PRIMARY_BUCKETS: BucketCode[] = ['IMG', 'VID']
+const SUPPORTING_BUCKETS: BucketCode[] = ['AUD', 'MUS', 'TRN', 'BTS']
 const BUCKET_LABEL_BY_CODE: Record<BucketCode, string> = {
   IMG: 'Images',
   VID: 'Videos',
@@ -541,10 +543,7 @@ function App() {
   const [vidBucketConfig, setVidBucketConfig] = useState<BucketWizardConfig>(defaultBucketConfig)
   const [vidMirrorImages, setVidMirrorImages] = useState(false)
   const [slotWizardLoading, setSlotWizardLoading] = useState(false)
-  const [showAddMoreSlotsDialog, setShowAddMoreSlotsDialog] = useState(false)
-  const [addMoreBucket, setAddMoreBucket] = useState<BucketCode>('IMG')
-  const [addMoreCount, setAddMoreCount] = useState(1)
-  const [addMoreLoading, setAddMoreLoading] = useState(false)
+  const [showPreferences, setShowPreferences] = useState(false)
 
   const [activeTab, setActiveTab] = useState<DashboardTab>('scan')
 
@@ -582,6 +581,18 @@ function App() {
     () => slots.find((slot) => getId(slot) === selectedSlotId) ?? null,
     [slots, selectedSlotId]
   )
+
+  const selectedProjectDisplay = useMemo(() => {
+    if (!selectedProject) {
+      return 'No project selected'
+    }
+
+    const code = getProjectCode(selectedProject)
+    const brand = getProjectBrandName(selectedProject)
+    return `${code} — ${brand}`
+  }, [selectedProject])
+
+  const slotsConfigured = slots.length > 0
 
   const filteredProjects = useMemo(() => {
     const query = projectSearch.trim().toLowerCase()
@@ -1158,34 +1169,6 @@ function App() {
     }
   }
 
-  const handleAddMoreSlots = async () => {
-    if (!selectedProjectId) return
-
-    const count = Math.max(1, Number(addMoreCount))
-    setAddMoreLoading(true)
-    setSlotsError(null)
-    setSlotActionMessage(null)
-
-    try {
-      await extendSlotSeries(selectedProjectId, addMoreBucket, count)
-      await loadSlots(selectedProjectId, { keepSelection: true })
-      setSlotActionMessage({
-        kind: 'success',
-        text: `Added ${count} ${addMoreBucket} slot(s).`
-      })
-      setShowAddMoreSlotsDialog(false)
-    } catch (error: unknown) {
-      const formattedError = formatSupabaseError(error)
-      setSlotsError(formattedError)
-      setSlotActionMessage({
-        kind: 'error',
-        text: `Unable to add slots. ${formattedError}`
-      })
-    } finally {
-      setAddMoreLoading(false)
-    }
-  }
-
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session)
@@ -1236,7 +1219,6 @@ function App() {
   useEffect(() => {
     if (!selectedProjectId) {
       setShowSlotWizard(false)
-      setShowAddMoreSlotsDialog(false)
       resetSlotWizard()
       setSlotActionMessage(null)
       setSlots([])
@@ -1254,7 +1236,6 @@ function App() {
     }
 
     setShowSlotWizard(false)
-    setShowAddMoreSlotsDialog(false)
     resetSlotWizard()
     setSlotActionMessage(null)
     loadSlots(selectedProjectId).catch((error: unknown) => {
@@ -1761,12 +1742,30 @@ function App() {
     }
   }
 
+  const invokeDriveRootApi = async (methodName: string, channel: string, ...args: unknown[]) => {
+    const apiCandidate = (window as unknown as { api?: Record<string, unknown> }).api
+    const method = apiCandidate?.[methodName]
+    if (typeof method === 'function') {
+      return (method as (...methodArgs: unknown[]) => Promise<unknown>)(...args)
+    }
+
+    const electronApi = (window as unknown as { electron?: { ipcRenderer?: { invoke?: (...invokeArgs: unknown[]) => Promise<unknown> } } }).electron
+    const invoke = electronApi?.ipcRenderer?.invoke
+    if (typeof invoke === 'function') {
+      return invoke(channel, ...args)
+    }
+
+    throw new Error(`Drive root API unavailable (${methodName}).`)
+  }
+
   const loadDriveRootConfig = async () => {
     setDriveRootLoading(true)
     setDriveRootMessage(null)
 
     try {
-      const config = await window.api.getDriveRootPath()
+      const config = (await invokeDriveRootApi('getDriveRootPath', 'get-drive-root-path')) as {
+        driveRootPath: string | null
+      }
       const savedPath = config.driveRootPath
       setDriveRootPath(savedPath)
       setDriveRootInput(savedPath ?? '')
@@ -1783,7 +1782,11 @@ function App() {
     if (!selectedPath) return
 
     setDriveRootInput(selectedPath)
-    const validation = await window.api.validateDriveRootPath(selectedPath)
+    const validation = (await invokeDriveRootApi('validateDriveRootPath', 'validate-drive-root-path', selectedPath)) as {
+      valid: boolean
+      normalizedPath: string | null
+      error: string | null
+    }
 
     if (validation.valid && validation.normalizedPath) {
       setDriveRootMessage({ kind: 'success', text: 'Path looks valid. Save to persist it.' })
@@ -1793,7 +1796,11 @@ function App() {
   }
 
   const handleValidateDriveRoot = async () => {
-    const validation = await window.api.validateDriveRootPath(driveRootInput || null)
+    const validation = (await invokeDriveRootApi('validateDriveRootPath', 'validate-drive-root-path', driveRootInput || null)) as {
+      valid: boolean
+      normalizedPath: string | null
+      error: string | null
+    }
     if (validation.valid && validation.normalizedPath) {
       setDriveRootMessage({ kind: 'success', text: `Valid path: ${validation.normalizedPath}` })
       return
@@ -1807,7 +1814,11 @@ function App() {
     setDriveRootMessage(null)
 
     try {
-      const result = await window.api.setDriveRootPath(driveRootInput || null)
+      const result = (await invokeDriveRootApi('setDriveRootPath', 'set-drive-root-path', driveRootInput || null)) as {
+        success: boolean
+        driveRootPath: string | null
+        error: string | null
+      }
       if (!result.success) {
         setDriveRootMessage({ kind: 'error', text: result.error ?? 'Failed to save drive root path.' })
         return
@@ -1891,131 +1902,210 @@ function App() {
 
           <div style={styles.sectionHeader}>
             <p style={styles.sidebarCaption}>Slots</p>
-            {selectedProjectId && (
-              <div style={styles.slotActionButtons}>
-                {slots.length > 0 && (
-                  <button
-                    onClick={() => {
-                      setSlotActionMessage(null)
-                      setShowAddMoreSlotsDialog((current) => !current)
-                      setShowSlotWizard(false)
-                    }}
-                    disabled={addMoreLoading || slotWizardLoading}
-                    style={styles.iconButtonWide}
-                    title="Add more slots"
-                  >
-                    Add More
-                  </button>
-                )}
-                <button
-                  onClick={openSlotWizard}
-                  disabled={slotWizardLoading || addMoreLoading}
-                  style={styles.iconButtonWide}
-                  title={slots.length === 0 ? 'Set up slots' : 'Open full slot wizard'}
-                >
-                  <Plus size={12} /> {slots.length === 0 ? 'Set Up' : 'Wizard'}
-                </button>
-              </div>
-            )}
           </div>
 
+          <div style={styles.listWrap}>
+            {!selectedProjectId ? (
+              <div style={styles.mutedRow}>Select a project</div>
+            ) : slotsLoading ? (
+              <div style={styles.mutedRow}>Loading slots...</div>
+            ) : slots.length === 0 ? (
+              <div style={styles.mutedRow}>No slots for this project</div>
+            ) : (
+              slots.map((slot) => {
+                const id = getId(slot)
+                const selected = id === selectedSlotId
+                const sequence = getSlotSequence(slot)
+                const slotCode = getSlotCode(slot)
+                const slotLabel = getSlotLabel(slot)
+
+                return (
+                  <button
+                    key={id}
+                    style={selected ? styles.slotRowSelected : styles.slotRow}
+                    onClick={() => setSelectedSlotId(id)}
+                  >
+                    <span style={styles.projectTitle}>{slotCode}</span>
+                    <span style={styles.projectSub}>
+                      {slotLabel}
+                      {sequence !== null ? ` · Current sequence: ${sequence}` : ''}
+                    </span>
+                  </button>
+                )
+              })
+            )}
+          </div>
+        </div>
+
+        <div style={styles.footer}>
+          <button
+            onClick={() => {
+              setShowPreferences(true)
+              setDriveRootMessage(null)
+              loadDriveRootConfig().catch((error: unknown) => {
+                setDriveRootMessage({
+                  kind: 'error',
+                  text: error instanceof Error ? error.message : 'Failed to load preferences.'
+                })
+              })
+            }}
+            style={styles.preferencesButton}
+          >
+            Preferences
+          </button>
+          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 12 }}>{session.user.email}</div>
+          <button onClick={() => supabase.auth.signOut()} style={styles.signOutButton}>
+            <LogOut size={14} /> Sign Out
+          </button>
+        </div>
+      </aside>
+
+      <main style={styles.main}>
+        <div style={styles.headerRow}>
+          <div>
+            <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>Upload Dashboard</h1>
+            <p style={{ color: '#94a3b8', margin: 0 }}>
+              {selectedProject
+                ? `${getProjectCode(selectedProject)}${selectedSlot ? ` / ${getSlotLabel(selectedSlot)}` : ''}`
+                : 'Select a project and slot to continue'}
+            </p>
+          </div>
+
+          <button
+            onClick={() => {
+              loadProjects({ keepSelection: true }).catch((error: unknown) => {
+                setProjectsError(error instanceof Error ? error.message : 'Unknown refresh error')
+              })
+              if (selectedProjectId) {
+                loadSlots(selectedProjectId, { keepSelection: true }).catch((error: unknown) => {
+                  setSlotsError(error instanceof Error ? error.message : 'Unknown refresh error')
+                })
+              }
+            }}
+            style={styles.refreshButton}
+            title="Refresh projects and slots"
+          >
+            <RefreshCcw size={14} /> Refresh
+          </button>
+        </div>
+
+        {(projectsError || slotsError) && (
+          <div style={styles.errorBanner}>
+            {projectsError && <div>Projects: {projectsError}</div>}
+            {slotsError && <div>Slots: {slotsError}</div>}
+          </div>
+        )}
+
+        {!showSlotWizard && selectedProjectId && slotsConfigured && (
+          <div style={styles.tabBar}>
+            {(['scan', 'plan', 'execution'] as DashboardTab[]).map((tab) => (
+              <button
+                key={tab}
+                style={activeTab === tab ? styles.tabButtonActive : styles.tabButton}
+                onClick={() => setActiveTab(tab)}
+              >
+                {tab[0].toUpperCase() + tab.slice(1)}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <section style={styles.panel}>
           {slotActionMessage && (
             <div style={slotActionMessage.kind === 'error' ? styles.errorBannerCompact : styles.successBannerCompact}>
               {slotActionMessage.text}
             </div>
           )}
 
-          {selectedProjectId && !slotsLoading && slots.length === 0 && !showSlotWizard && (
-            <div style={styles.slotSetupEmptyState}>
-              <div style={styles.slotSetupTitle}>Set up ingestion slots</div>
-              <div style={styles.slotSetupText}>
-                Create media buckets (IMG, VID, AUD, MUS, TRN, BTS) before mapping folders.
-              </div>
-              <button onClick={openSlotWizard} style={styles.createButton}>
+          {!selectedProjectId && <div style={styles.mutedPanel}>Select a project to begin.</div>}
+
+          {selectedProjectId && slotsLoading && <div style={styles.mutedPanel}>Loading slots...</div>}
+
+          {selectedProjectId && !slotsLoading && !slotsConfigured && !showSlotWizard && (
+            <div style={styles.projectSetupEmptyState}>
+              <div style={styles.projectSetupIcon}>+</div>
+              <h3 style={styles.projectSetupTitle}>Set up ingestion slots</h3>
+              <p style={styles.projectSetupText}>
+                Configure slot categories for <strong>{selectedProjectDisplay}</strong> before scanning folders.
+              </p>
+              <button onClick={openSlotWizard} style={styles.setupPrimaryButton}>
                 <Plus size={14} /> Set Up Slots
               </button>
             </div>
           )}
 
-          {selectedProjectId && showAddMoreSlotsDialog && slots.length > 0 && (
-            <div style={styles.slotDialogPanel}>
-              <div style={styles.slotDialogTitle}>Add More Slots</div>
-              <div style={styles.slotDialogText}>Extend an existing bucket series using `extend_slot_series`.</div>
-
-              <label style={styles.settingsLabel}>Bucket</label>
-              <select
-                value={addMoreBucket}
-                onChange={(event) => setAddMoreBucket(event.target.value as BucketCode)}
-                style={styles.mappingSelect}
-              >
-                {BUCKETS.map((bucket) => (
-                  <option key={bucket.code} value={bucket.code}>
-                    {bucket.code} · {bucket.label}
-                  </option>
-                ))}
-              </select>
-
-              <label style={styles.settingsLabel}>Count</label>
-              <input
-                type="number"
-                min={1}
-                value={addMoreCount}
-                onChange={(event) => setAddMoreCount(Math.max(1, Number.parseInt(event.target.value, 10) || 1))}
-                style={styles.createInput}
-              />
-
-              <div style={styles.slotDialogActions}>
-                <button
-                  onClick={() => setShowAddMoreSlotsDialog(false)}
-                  disabled={addMoreLoading}
-                  style={styles.actionButtonSecondary}
-                >
-                  Close
-                </button>
-                <button onClick={handleAddMoreSlots} disabled={addMoreLoading} style={styles.actionButtonPrimary}>
-                  {addMoreLoading ? 'Adding...' : `Add ${Math.max(1, addMoreCount)} Slot(s)`}
-                </button>
-              </div>
-            </div>
-          )}
-
           {selectedProjectId && showSlotWizard && (
-            <div style={styles.slotDialogPanel}>
-              <div style={styles.slotDialogTitle}>Create Media Buckets</div>
-              <div style={styles.slotDialogText}>
-                Step {slotWizardStep} of 4. Build slot codes with deterministic rules before ingestion.
-              </div>
+            <div style={styles.slotWizardPanel}>
+              <h3 style={styles.slotWizardHeader}>Set Up Ingestion Slots</h3>
+              <p style={styles.slotWizardProjectLine}>Project: {selectedProjectDisplay}</p>
+              <p style={styles.slotDialogText}>
+                Step {slotWizardStep} of 4. Build deterministic slot codes before ingestion.
+              </p>
 
               {slotWizardStep === 1 && (
                 <div style={styles.wizardSection}>
-                  <div style={styles.slotSetupTitle}>Set up ingestion slots</div>
+                  <div style={styles.wizardSectionTitle}>Overview</div>
                   <div style={styles.slotSetupText}>
-                    This wizard matches Garuda Web behavior: flat/custom inserts plus `extend_slot_series` for auto slot
-                    series.
+                    This wizard creates project slots only. No scanning, renaming, copy, or upload runs here.
+                  </div>
+                  <div style={styles.slotSetupText}>
+                    Creation paths mirror Garuda Web: flat/custom inserts + `extend_slot_series` for auto sequences.
                   </div>
                 </div>
               )}
 
               {slotWizardStep === 2 && (
                 <div style={styles.wizardSection}>
-                  <div style={styles.wizardSectionTitle}>Select Buckets</div>
+                  <div style={styles.wizardSectionTitle}>Select Slot Categories</div>
+
+                  <div style={styles.wizardBucketGroupTitle}>Primary</div>
                   <div style={styles.bucketGrid}>
-                    {BUCKETS.map((bucket) => (
-                      <label key={bucket.code} style={styles.bucketOption}>
-                        <input
-                          type="checkbox"
-                          checked={bucketSelection[bucket.code]}
-                          onChange={(event) =>
-                            setBucketSelection((current) => ({
-                              ...current,
-                              [bucket.code]: event.target.checked
-                            }))
-                          }
-                        />
-                        <span>{bucket.code}</span>
-                        <span style={styles.projectSub}>{bucket.label}</span>
-                      </label>
-                    ))}
+                    {PRIMARY_BUCKETS.map((bucketCode) => {
+                      const bucket = BUCKETS.find((entry) => entry.code === bucketCode)
+                      if (!bucket) return null
+
+                      return (
+                        <label key={bucket.code} style={styles.bucketOption}>
+                          <input
+                            type="checkbox"
+                            checked={bucketSelection[bucket.code]}
+                            onChange={(event) =>
+                              setBucketSelection((current) => ({
+                                ...current,
+                                [bucket.code]: event.target.checked
+                              }))
+                            }
+                          />
+                          <span>{bucket.code}</span>
+                          <span style={styles.projectSub}>{bucket.label}</span>
+                        </label>
+                      )
+                    })}
+                  </div>
+
+                  <div style={styles.wizardBucketGroupTitle}>Supporting</div>
+                  <div style={styles.bucketGrid}>
+                    {SUPPORTING_BUCKETS.map((bucketCode) => {
+                      const bucket = BUCKETS.find((entry) => entry.code === bucketCode)
+                      if (!bucket) return null
+
+                      return (
+                        <label key={bucket.code} style={styles.bucketOption}>
+                          <input
+                            type="checkbox"
+                            checked={bucketSelection[bucket.code]}
+                            onChange={(event) =>
+                              setBucketSelection((current) => ({
+                                ...current,
+                                [bucket.code]: event.target.checked
+                              }))
+                            }
+                          />
+                          <span>{bucket.code}</span>
+                          <span style={styles.projectSub}>{bucket.label}</span>
+                        </label>
+                      )
+                    })}
                   </div>
                 </div>
               )}
@@ -2232,12 +2322,12 @@ function App() {
                     </div>
                   )}
 
-                  {selectedWizardBuckets.filter((bucket) => bucket !== 'IMG' && bucket !== 'VID').length > 0 && (
+                  {selectedWizardBuckets.filter((bucket) => !PRIMARY_BUCKETS.includes(bucket)).length > 0 && (
                     <div style={styles.wizardBucketPanel}>
-                      <div style={styles.wizardSectionTitle}>Flat buckets</div>
+                      <div style={styles.wizardSectionTitle}>Supporting buckets</div>
                       <div style={styles.slotDialogText}>
                         {selectedWizardBuckets
-                          .filter((bucket) => bucket !== 'IMG' && bucket !== 'VID')
+                          .filter((bucket) => !PRIMARY_BUCKETS.includes(bucket))
                           .map((bucket) => `${bucket} (${BUCKET_LABEL_BY_CODE[bucket]})`)
                           .join(', ')}
                       </div>
@@ -2248,7 +2338,8 @@ function App() {
 
               {slotWizardStep === 4 && (
                 <div style={styles.wizardSection}>
-                  <div style={styles.wizardSectionTitle}>Review</div>
+                  <div style={styles.wizardSectionTitle}>Review & Confirm</div>
+                  <div style={styles.slotDialogText}>Deterministic slot code plan for {selectedProjectDisplay}</div>
                   {slotWizardReview.previewByBucket.map((entry) => (
                     <div key={entry.bucket} style={styles.wizardBucketPanel}>
                       <div style={styles.projectTitle}>
@@ -2256,12 +2347,12 @@ function App() {
                       </div>
                       {entry.autoCount > 0 && (
                         <div style={styles.projectSub}>
-                          Auto series: +{entry.autoCount} via `extend_slot_series`
+                          Auto series: +{entry.autoCount} via `extend_slot_series` (continues bucket sequence deterministically)
                         </div>
                       )}
                       {entry.insertItems.map((item) => (
                         <div key={item.slotCode} style={styles.projectSub}>
-                          Insert: {item.slotCode} ({item.slotName})
+                          {item.slotCode} ({item.slotName})
                         </div>
                       ))}
                     </div>
@@ -2282,6 +2373,7 @@ function App() {
                   onClick={() => {
                     setShowSlotWizard(false)
                     resetSlotWizard()
+                    setSlotActionMessage(null)
                   }}
                   disabled={slotWizardLoading}
                   style={styles.actionButtonSecondary}
@@ -2327,97 +2419,7 @@ function App() {
             </div>
           )}
 
-          <div style={styles.listWrap}>
-            {!selectedProjectId ? (
-              <div style={styles.mutedRow}>Select a project</div>
-            ) : slotsLoading ? (
-              <div style={styles.mutedRow}>Loading slots...</div>
-            ) : slots.length === 0 ? (
-              <div style={styles.mutedRow}>No slots for this project</div>
-            ) : (
-              slots.map((slot) => {
-                const id = getId(slot)
-                const selected = id === selectedSlotId
-                const sequence = getSlotSequence(slot)
-                const slotCode = getSlotCode(slot)
-                const slotLabel = getSlotLabel(slot)
-
-                return (
-                  <button
-                    key={id}
-                    style={selected ? styles.slotRowSelected : styles.slotRow}
-                    onClick={() => setSelectedSlotId(id)}
-                  >
-                    <span style={styles.projectTitle}>{slotCode}</span>
-                    <span style={styles.projectSub}>
-                      {slotLabel}
-                      {sequence !== null ? ` · Current sequence: ${sequence}` : ''}
-                    </span>
-                  </button>
-                )
-              })
-            )}
-          </div>
-        </div>
-
-        <div style={styles.footer}>
-          <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 12 }}>{session.user.email}</div>
-          <button onClick={() => supabase.auth.signOut()} style={styles.signOutButton}>
-            <LogOut size={14} /> Sign Out
-          </button>
-        </div>
-      </aside>
-
-      <main style={styles.main}>
-        <div style={styles.headerRow}>
-          <div>
-            <h1 style={{ fontSize: 24, fontWeight: 700, marginBottom: 8 }}>Upload Dashboard</h1>
-            <p style={{ color: '#94a3b8', margin: 0 }}>
-              {selectedProject
-                ? `${getProjectCode(selectedProject)}${selectedSlot ? ` / ${getSlotLabel(selectedSlot)}` : ''}`
-                : 'Select a project and slot to continue'}
-            </p>
-          </div>
-
-          <button
-            onClick={() => {
-              loadProjects({ keepSelection: true }).catch((error: unknown) => {
-                setProjectsError(error instanceof Error ? error.message : 'Unknown refresh error')
-              })
-              if (selectedProjectId) {
-                loadSlots(selectedProjectId, { keepSelection: true }).catch((error: unknown) => {
-                  setSlotsError(error instanceof Error ? error.message : 'Unknown refresh error')
-                })
-              }
-            }}
-            style={styles.refreshButton}
-            title="Refresh projects and slots"
-          >
-            <RefreshCcw size={14} /> Refresh
-          </button>
-        </div>
-
-        {(projectsError || slotsError) && (
-          <div style={styles.errorBanner}>
-            {projectsError && <div>Projects: {projectsError}</div>}
-            {slotsError && <div>Slots: {slotsError}</div>}
-          </div>
-        )}
-
-        <div style={styles.tabBar}>
-          {(['scan', 'plan', 'execution', 'settings'] as DashboardTab[]).map((tab) => (
-            <button
-              key={tab}
-              style={activeTab === tab ? styles.tabButtonActive : styles.tabButton}
-              onClick={() => setActiveTab(tab)}
-            >
-              {tab[0].toUpperCase() + tab.slice(1)}
-            </button>
-          ))}
-        </div>
-
-        <section style={styles.panel}>
-          {activeTab === 'scan' && (
+          {selectedProjectId && slotsConfigured && !showSlotWizard && activeTab === 'scan' && (
             <>
               <p style={styles.tabIntro}>Select and scan a source folder. Phase 3 will expand this into hash/type planning.</p>
 
@@ -2476,7 +2478,7 @@ function App() {
             </>
           )}
 
-          {activeTab === 'plan' && (
+          {selectedProjectId && slotsConfigured && !showSlotWizard && activeTab === 'plan' && (
             <>
               <h3 style={styles.todoHeading}>Folder to Slot Mapping</h3>
               <p style={styles.todoText}>
@@ -2665,7 +2667,7 @@ function App() {
             </>
           )}
 
-          {activeTab === 'execution' && (
+          {selectedProjectId && slotsConfigured && !showSlotWizard && activeTab === 'execution' && (
             <>
               <h3 style={styles.todoHeading}>Execution (Streaming Dry Run)</h3>
               <p style={styles.todoText}>
@@ -2822,50 +2824,61 @@ function App() {
             </>
           )}
 
-          {activeTab === 'settings' && (
-            <>
-              <h3 style={styles.todoHeading}>Drive Root Path</h3>
-              <p style={styles.todoText}>
-                Select your local Google Drive Stream root path. This is saved in local app config and validated before save.
-              </p>
-
-              <div style={styles.settingsBlock}>
-                <label style={styles.settingsLabel}>Saved Path</label>
-                <div style={styles.savedPathBox}>{driveRootPath ?? 'Not configured'}</div>
-              </div>
-
-              <div style={styles.settingsBlock}>
-                <label style={styles.settingsLabel}>Drive Root</label>
-                <div style={styles.settingsInputRow}>
-                  <input
-                    value={driveRootInput}
-                    onChange={(event) => setDriveRootInput(event.target.value)}
-                    placeholder="/Users/you/Library/CloudStorage/GoogleDrive-..."
-                    style={styles.settingsInput}
-                  />
-                  <button onClick={handlePickDriveRoot} style={styles.actionButtonSecondary}>
-                    <FolderOpen size={16} /> Browse
-                  </button>
-                </div>
-                <div style={styles.settingsButtonRow}>
-                  <button onClick={handleValidateDriveRoot} style={styles.actionButtonSecondary} disabled={driveRootLoading}>
-                    Validate
-                  </button>
-                  <button onClick={handleSaveDriveRoot} style={styles.actionButtonPrimary} disabled={driveRootSaving}>
-                    {driveRootSaving ? 'Saving...' : 'Save'}
-                  </button>
-                </div>
-              </div>
-
-              {driveRootMessage && (
-                <div style={driveRootMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
-                  {driveRootMessage.text}
-                </div>
-              )}
-            </>
-          )}
         </section>
       </main>
+      {showPreferences && (
+        <div style={styles.preferencesOverlay}>
+          <div style={styles.preferencesModal}>
+            <div style={styles.preferencesHeader}>
+              <div>
+                <h3 style={styles.todoHeading}>Preferences</h3>
+                <p style={styles.todoText}>Global settings for this desktop machine.</p>
+              </div>
+              <button onClick={() => setShowPreferences(false)} style={styles.actionButtonSecondary}>
+                Close
+              </button>
+            </div>
+
+            <div style={styles.settingsBlock}>
+              <h4 style={styles.mappingSummaryTitle}>Google Drive Root Path</h4>
+              <p style={styles.slotDialogText}>
+                This is the local Google Drive stream folder used for ingestion. It is stored in local app config.
+              </p>
+              <label style={styles.settingsLabel}>Saved Path</label>
+              <div style={styles.savedPathBox}>{driveRootPath ?? 'Not configured'}</div>
+            </div>
+
+            <div style={styles.settingsBlock}>
+              <label style={styles.settingsLabel}>Drive Root</label>
+              <div style={styles.settingsInputRow}>
+                <input
+                  value={driveRootInput}
+                  onChange={(event) => setDriveRootInput(event.target.value)}
+                  placeholder="/Users/you/Library/CloudStorage/GoogleDrive-..."
+                  style={styles.settingsInput}
+                />
+                <button onClick={handlePickDriveRoot} style={styles.actionButtonSecondary}>
+                  <FolderOpen size={16} /> Browse
+                </button>
+              </div>
+              <div style={styles.settingsButtonRow}>
+                <button onClick={handleValidateDriveRoot} style={styles.actionButtonSecondary} disabled={driveRootLoading}>
+                  Validate
+                </button>
+                <button onClick={handleSaveDriveRoot} style={styles.actionButtonPrimary} disabled={driveRootSaving}>
+                  {driveRootSaving ? 'Saving...' : 'Save'}
+                </button>
+              </div>
+            </div>
+
+            {driveRootMessage && (
+              <div style={driveRootMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
+                {driveRootMessage.text}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -3129,6 +3142,12 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     color: '#cbd5e1',
   },
+  wizardBucketGroupTitle: {
+    fontSize: 12,
+    color: '#94a3b8',
+    fontWeight: 600,
+    marginTop: 6,
+  },
   bucketGrid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
@@ -3174,6 +3193,21 @@ const styles: Record<string, React.CSSProperties> = {
   footer: {
     borderTop: '1px solid #1e293b',
     paddingTop: 16,
+  },
+  preferencesButton: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    border: '1px solid #334155',
+    background: '#0f172a',
+    color: '#cbd5e1',
+    borderRadius: 8,
+    padding: '8px 10px',
+    cursor: 'pointer',
+    marginBottom: 10,
+    width: '100%',
+    fontSize: 13,
+    fontWeight: 600
   },
   signOutButton: {
     display: 'flex',
@@ -3280,6 +3314,74 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#0b1220',
     padding: 20,
     minHeight: 280,
+  },
+  projectSetupEmptyState: {
+    minHeight: 340,
+    border: '1px solid #1e293b',
+    borderRadius: 12,
+    background: '#0f172a',
+    display: 'grid',
+    placeItems: 'center',
+    textAlign: 'center',
+    padding: 24,
+    gap: 10,
+  },
+  projectSetupIcon: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    display: 'grid',
+    placeItems: 'center',
+    background: '#dbeafe',
+    color: '#1d4ed8',
+    fontSize: 34,
+    lineHeight: 1,
+    fontWeight: 500
+  },
+  projectSetupTitle: {
+    margin: 0,
+    fontSize: 28,
+    fontWeight: 700,
+    color: '#e2e8f0'
+  },
+  projectSetupText: {
+    margin: 0,
+    maxWidth: 620,
+    fontSize: 16,
+    color: '#94a3b8',
+    lineHeight: 1.5
+  },
+  setupPrimaryButton: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    border: 'none',
+    borderRadius: 10,
+    background: '#2563eb',
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: 700,
+    padding: '12px 18px',
+    cursor: 'pointer'
+  },
+  slotWizardPanel: {
+    border: '1px solid #1e293b',
+    borderRadius: 12,
+    background: '#0f172a',
+    padding: 18,
+    display: 'grid',
+    gap: 12
+  },
+  slotWizardHeader: {
+    margin: 0,
+    fontSize: 22,
+    fontWeight: 700,
+    color: '#e2e8f0'
+  },
+  slotWizardProjectLine: {
+    margin: 0,
+    fontSize: 14,
+    color: '#93c5fd'
   },
   tabIntro: {
     marginTop: 0,
@@ -3584,6 +3686,31 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex',
     gap: 10,
     marginTop: 10,
+  },
+  preferencesOverlay: {
+    position: 'fixed',
+    inset: 0,
+    background: 'rgba(2, 6, 23, 0.72)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 1000,
+    padding: 24
+  },
+  preferencesModal: {
+    width: '100%',
+    maxWidth: 900,
+    border: '1px solid #1e293b',
+    borderRadius: 12,
+    background: '#0b1220',
+    padding: 20
+  },
+  preferencesHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+    gap: 12,
+    marginBottom: 14
   },
 }
 
