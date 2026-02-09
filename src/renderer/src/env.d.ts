@@ -78,6 +78,27 @@ declare global {
     results: DryRunFileResult[]
   }
 
+  type VerifyDestinationRequestItem = {
+    filePath: string
+    expectedSizeBytes: number | null
+    expectedFilename: string | null
+  }
+
+  type VerifyDestinationResultItem = {
+    filePath: string
+    localPath: string
+    exists: boolean
+    filenameMatches: boolean
+    sizeMatches: boolean
+    actualSizeBytes: number | null
+    error: string | null
+  }
+
+  type VerifyDestinationResult = {
+    success: boolean
+    results: VerifyDestinationResultItem[]
+  }
+
   type FilesystemExecutionUploadItem = {
     projectId: string
     slotId: string
@@ -152,6 +173,7 @@ declare global {
       validateDriveRootPath: (candidatePath: string | null) => Promise<DrivePathValidation>
       setDriveRootPath: (candidatePath: string | null) => Promise<SaveDriveRootResult>
       dryRunStreamOpen: (items: DryRunRequestItem[]) => Promise<DryRunResult>
+      verifyDestinationPaths: (items: VerifyDestinationRequestItem[]) => Promise<VerifyDestinationResult>
       executeFilesystemStreamPlan: (request: ExecuteFilesystemStreamRequest) => Promise<ExecuteFilesystemStreamResult>
     }
   }

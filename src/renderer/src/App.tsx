@@ -104,6 +104,58 @@ type ExecutionValidation = {
   errors: ExecutionError[]
 }
 
+type ExistingUploadRow = {
+  id: string
+  project_id: string
+  slot_id: string | null
+  sha256: string | null
+  file_path: string | null
+  file_size: number | null
+  final_filename: string | null
+  upload_stage: string | null
+  completed_at: string | null
+  is_source_file: boolean | null
+}
+
+type PreflightFileStatus = 'already_uploaded' | 'pending_upload' | 'missing_unreadable'
+type SlotExecutionStatus = 'complete' | 'partial' | 'blocked'
+
+type PreflightFileResult = {
+  slotId: string
+  slotLabel: string
+  sourcePath: string
+  sourceFilename: string
+  sha256: string
+  status: PreflightFileStatus
+  reason: string | null
+}
+
+type PreflightSlotSummary = {
+  slotId: string
+  slotLabel: string
+  totalFiles: number
+  alreadyUploaded: number
+  pendingUpload: number
+  missingUnreadable: number
+  status: SlotExecutionStatus
+}
+
+type ExecutionPreflight = {
+  alreadyUploadedCount: number
+  pendingUploadCount: number
+  missingUnreadableCount: number
+  slotSummaries: PreflightSlotSummary[]
+  fileResults: PreflightFileResult[]
+  hasPartialResume: boolean
+}
+
+type VerificationResultSummary = {
+  checked: number
+  valid: number
+  invalid: number
+  details: VerifyDestinationResultItem[]
+}
+
 type MappingValidation = {
   fileTypeMismatches: string[]
   emptySlots: string[]
@@ -326,6 +378,13 @@ function App() {
   const [executionValidation, setExecutionValidation] = useState<ExecutionValidation | null>(null)
   const [uploadRunning, setUploadRunning] = useState(false)
   const [uploadResultMessage, setUploadResultMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
+  const [existingUploads, setExistingUploads] = useState<ExistingUploadRow[]>([])
+  const [preflightLoading, setPreflightLoading] = useState(false)
+  const [executionPreflight, setExecutionPreflight] = useState<ExecutionPreflight | null>(null)
+  const [verificationRunning, setVerificationRunning] = useState(false)
+  const [verificationSummary, setVerificationSummary] = useState<VerificationResultSummary | null>(null)
+  const [resumeNotice, setResumeNotice] = useState<string | null>(null)
+  const [autoPreflightDoneKey, setAutoPreflightDoneKey] = useState<string | null>(null)
 
   const selectedProject = useMemo(
     () => projects.find((project) => getId(project) === selectedProjectId) ?? null,
@@ -782,6 +841,24 @@ function App() {
   }, [session])
 
   useEffect(() => {
+    if (activeTab !== 'execution') return
+    if (!selectedProject || executionPlan.length === 0) return
+
+    const key = `${selectedProject.id}:${executionPlan.length}`
+    if (autoPreflightDoneKey === key) {
+      return
+    }
+
+    setAutoPreflightDoneKey(key)
+    handleRunExecutionPreflight().catch((error: unknown) => {
+      setUploadResultMessage({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Failed to auto-run execution preflight.'
+      })
+    })
+  }, [activeTab, autoPreflightDoneKey, executionPlan.length, selectedProject])
+
+  useEffect(() => {
     if (!selectedProjectId) {
       setSlots([])
       setSelectedSlotId(null)
@@ -789,6 +866,11 @@ function App() {
       setSlotNamingOverrides({})
       setExecutionValidation(null)
       setUploadResultMessage(null)
+      setExistingUploads([])
+      setExecutionPreflight(null)
+      setVerificationSummary(null)
+      setResumeNotice(null)
+      setAutoPreflightDoneKey(null)
       return
     }
 
@@ -806,6 +888,11 @@ function App() {
     setMappingMessage(null)
     setExecutionValidation(null)
     setUploadResultMessage(null)
+    setExistingUploads([])
+    setExecutionPreflight(null)
+    setVerificationSummary(null)
+    setResumeNotice(null)
+    setAutoPreflightDoneKey(null)
   }
 
   const handleScan = async () => {
@@ -817,6 +904,11 @@ function App() {
     setMappingMessage(null)
     setExecutionValidation(null)
     setUploadResultMessage(null)
+    setExistingUploads([])
+    setExecutionPreflight(null)
+    setVerificationSummary(null)
+    setResumeNotice(null)
+    setAutoPreflightDoneKey(null)
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
     setScanning(false)
@@ -829,6 +921,9 @@ function App() {
   const handleAssignFolderToSlot = (folderRelativePath: string, slotId: string) => {
     setExecutionValidation(null)
     setUploadResultMessage(null)
+    setExecutionPreflight(null)
+    setVerificationSummary(null)
+    setResumeNotice(null)
     setFolderSlotAssignments((current) => {
       if (!slotId) {
         const next = { ...current }
@@ -846,6 +941,9 @@ function App() {
   const handleSlotPrefixOverride = (slotId: string, prefix: string) => {
     setExecutionValidation(null)
     setUploadResultMessage(null)
+    setExecutionPreflight(null)
+    setVerificationSummary(null)
+    setResumeNotice(null)
     setSlotNamingOverrides((current) => ({
       ...current,
       [slotId]: {
@@ -858,6 +956,9 @@ function App() {
   const handleSlotPaddingOverride = (slotId: string, rawPadding: string) => {
     setExecutionValidation(null)
     setUploadResultMessage(null)
+    setExecutionPreflight(null)
+    setVerificationSummary(null)
+    setResumeNotice(null)
     const parsed = Number.parseInt(rawPadding, 10)
     const padding = Number.isFinite(parsed) ? Math.min(8, Math.max(1, parsed)) : 4
 
@@ -981,8 +1082,207 @@ function App() {
     }
   }
 
+  const loadExistingUploadsForProject = async (projectId: string): Promise<ExistingUploadRow[]> => {
+    const { data, error } = await supabase
+      .from('project_uploads')
+      .select('id,project_id,slot_id,sha256,file_path,file_size,final_filename,upload_stage,completed_at,is_source_file')
+      .eq('project_id', projectId)
+      .eq('is_source_file', true)
+      .eq('upload_stage', 'completed')
+
+    if (error) {
+      throw error
+    }
+
+    return (data ?? []) as ExistingUploadRow[]
+  }
+
+  const handleRunExecutionPreflight = async () => {
+    if (!selectedProject || executionPlan.length === 0) {
+      setExecutionPreflight(null)
+      setResumeNotice(null)
+      return
+    }
+
+    setPreflightLoading(true)
+    setResumeNotice(null)
+
+    try {
+      const uploads = await loadExistingUploadsForProject(selectedProject.id)
+      setExistingUploads(uploads)
+
+      const uploadedHashes = new Set<string>()
+      for (const row of uploads) {
+        if (row.sha256) {
+          uploadedHashes.add(row.sha256)
+        }
+      }
+
+      const dryRun = await window.api.dryRunStreamOpen(
+        executionPlan.map((item) => ({
+          sourcePath: item.sourcePath,
+          expectedSizeBytes: item.sizeBytes
+        }))
+      )
+      const dryRunByPath = new Map<string, DryRunFileResult>()
+      for (const result of dryRun.results) {
+        dryRunByPath.set(result.sourcePath, result)
+      }
+
+      const fileResults: PreflightFileResult[] = executionPlan.map((item) => {
+        if (uploadedHashes.has(item.sha256)) {
+          return {
+            slotId: item.slotId,
+            slotLabel: item.slotLabel,
+            sourcePath: item.sourcePath,
+            sourceFilename: item.sourceFilename,
+            sha256: item.sha256,
+            status: 'already_uploaded',
+            reason: 'Found in completed uploads by sha256.'
+          }
+        }
+
+        const localCheck = dryRunByPath.get(item.sourcePath)
+        if (!localCheck || !localCheck.ok) {
+          return {
+            slotId: item.slotId,
+            slotLabel: item.slotLabel,
+            sourcePath: item.sourcePath,
+            sourceFilename: item.sourceFilename,
+            sha256: item.sha256,
+            status: 'missing_unreadable',
+            reason: localCheck?.message ?? 'File is missing or unreadable.'
+          }
+        }
+
+        return {
+          slotId: item.slotId,
+          slotLabel: item.slotLabel,
+          sourcePath: item.sourcePath,
+          sourceFilename: item.sourceFilename,
+          sha256: item.sha256,
+          status: 'pending_upload',
+          reason: null
+        }
+      })
+
+      const slotMap = new Map<string, PreflightSlotSummary>()
+      for (const file of fileResults) {
+        const existing = slotMap.get(file.slotId)
+        if (!existing) {
+          slotMap.set(file.slotId, {
+            slotId: file.slotId,
+            slotLabel: file.slotLabel,
+            totalFiles: 1,
+            alreadyUploaded: file.status === 'already_uploaded' ? 1 : 0,
+            pendingUpload: file.status === 'pending_upload' ? 1 : 0,
+            missingUnreadable: file.status === 'missing_unreadable' ? 1 : 0,
+            status: 'partial'
+          })
+        } else {
+          existing.totalFiles += 1
+          if (file.status === 'already_uploaded') existing.alreadyUploaded += 1
+          if (file.status === 'pending_upload') existing.pendingUpload += 1
+          if (file.status === 'missing_unreadable') existing.missingUnreadable += 1
+        }
+      }
+
+      const slotSummaries = Array.from(slotMap.values())
+        .map((slot) => {
+          if (slot.missingUnreadable > 0) {
+            slot.status = 'blocked'
+          } else if (slot.alreadyUploaded === slot.totalFiles) {
+            slot.status = 'complete'
+          } else {
+            slot.status = 'partial'
+          }
+          return slot
+        })
+        .sort((a, b) => a.slotLabel.localeCompare(b.slotLabel))
+
+      const alreadyUploadedCount = fileResults.filter((item) => item.status === 'already_uploaded').length
+      const pendingUploadCount = fileResults.filter((item) => item.status === 'pending_upload').length
+      const missingUnreadableCount = fileResults.filter((item) => item.status === 'missing_unreadable').length
+      const hasPartialResume = alreadyUploadedCount > 0 && pendingUploadCount > 0
+
+      setExecutionPreflight({
+        alreadyUploadedCount,
+        pendingUploadCount,
+        missingUnreadableCount,
+        slotSummaries,
+        fileResults,
+        hasPartialResume
+      })
+
+      if (hasPartialResume) {
+        setResumeNotice('This project has partially ingested files. Resume is safe: only pending files will be uploaded.')
+      }
+    } catch (error: unknown) {
+      setUploadResultMessage({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Failed to run preflight.'
+      })
+    } finally {
+      setPreflightLoading(false)
+    }
+  }
+
+  const handleRunVerification = async () => {
+    if (!selectedProject) {
+      return
+    }
+
+    setVerificationRunning(true)
+    setVerificationSummary(null)
+
+    try {
+      const uploads = await loadExistingUploadsForProject(selectedProject.id)
+      setExistingUploads(uploads)
+
+      const verifyItems: VerifyDestinationRequestItem[] = uploads.map((row) => ({
+        filePath: row.file_path ?? '',
+        expectedSizeBytes: row.file_size ?? null,
+        expectedFilename: row.final_filename ?? null
+      }))
+
+      const response = await window.api.verifyDestinationPaths(verifyItems)
+      const valid = response.results.filter((item) => item.exists && item.filenameMatches && item.sizeMatches).length
+      const invalid = response.results.length - valid
+
+      setVerificationSummary({
+        checked: response.results.length,
+        valid,
+        invalid,
+        details: response.results
+      })
+    } catch (error: unknown) {
+      setUploadResultMessage({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Verification failed.'
+      })
+    } finally {
+      setVerificationRunning(false)
+    }
+  }
+
   const handleExecuteDriveUpload = async () => {
     if (!executionValidation?.executionReady || executionPlan.length === 0 || !selectedProject || !session) {
+      return
+    }
+
+    if (!executionPreflight) {
+      setUploadResultMessage({
+        kind: 'error',
+        text: 'Run execution preflight before streaming.'
+      })
+      return
+    }
+
+    if (executionPreflight.missingUnreadableCount > 0) {
+      setUploadResultMessage({
+        kind: 'error',
+        text: 'Execution is blocked: one or more source files are missing or unreadable.'
+      })
       return
     }
 
@@ -991,9 +1291,13 @@ function App() {
 
     try {
       const projectCode = selectedProject.project_code?.trim() || 'PROJECT'
+      const pendingShaSet = new Set(
+        executionPreflight.fileResults.filter((row) => row.status === 'pending_upload').map((row) => row.sha256)
+      )
+      const pendingItems = executionPlan.filter((item) => pendingShaSet.has(item.sha256))
       const response = await window.api.executeFilesystemStreamPlan({
         accessToken: session.access_token,
-        items: executionPlan.map((item) => ({
+        items: pendingItems.map((item) => ({
           projectId: item.projectId,
           slotId: item.slotId,
           sourcePath: item.sourcePath,
@@ -1015,6 +1319,7 @@ function App() {
           kind: 'success',
           text: `Uploaded ${response.uploadedCount} · skipped ${response.skippedCount} · failed ${response.failedCount}`
         })
+        await handleRunExecutionPreflight()
         return
       }
 
@@ -1022,6 +1327,7 @@ function App() {
         kind: 'error',
         text: `Uploaded ${response.uploadedCount} · skipped ${response.skippedCount} · failed ${response.failedCount}. Stopped on ${response.failedItem.destinationFilename}: ${response.error}`
       })
+      await handleRunExecutionPreflight()
     } catch (error: unknown) {
       setUploadResultMessage({
         kind: 'error',
@@ -1536,6 +1842,7 @@ function App() {
                   Total size: {formatBytes(executionPlan.reduce((sum, item) => sum + item.sizeBytes, 0))}
                 </div>
                 <div style={styles.mappingSummaryText}>Slots: {executionPlanBySlot.length}</div>
+                <div style={styles.mappingSummaryText}>Completed rows in Supabase: {existingUploads.length}</div>
               </div>
 
               <div style={{ display: 'flex', gap: 10, marginTop: 12 }}>
@@ -1547,11 +1854,39 @@ function App() {
                   {executionRunning ? 'Running Dry Run...' : 'Run Streaming Dry Run'}
                 </button>
                 <button
+                  onClick={() => handleRunExecutionPreflight()}
+                  disabled={preflightLoading || executionPlan.length === 0}
+                  style={preflightLoading || executionPlan.length === 0 ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                >
+                  {preflightLoading ? 'Preflight...' : 'Run Resume Preflight'}
+                </button>
+                <button
                   onClick={handleExecuteDriveUpload}
-                  disabled={!executionValidation?.executionReady || uploadRunning || !session}
-                  style={!executionValidation?.executionReady || uploadRunning || !session ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                  disabled={
+                    !executionValidation?.executionReady ||
+                    uploadRunning ||
+                    !session ||
+                    !executionPreflight ||
+                    executionPreflight.missingUnreadableCount > 0
+                  }
+                  style={
+                    !executionValidation?.executionReady ||
+                    uploadRunning ||
+                    !session ||
+                    !executionPreflight ||
+                    executionPreflight.missingUnreadableCount > 0
+                      ? styles.actionButtonDisabled
+                      : styles.actionButtonSecondary
+                  }
                 >
                   {uploadRunning ? 'Streaming (Serial)...' : 'Execute Filesystem Stream'}
+                </button>
+                <button
+                  onClick={() => handleRunVerification()}
+                  disabled={verificationRunning || !selectedProject}
+                  style={verificationRunning || !selectedProject ? styles.actionButtonDisabled : styles.actionButtonSecondary}
+                >
+                  {verificationRunning ? 'Verifying...' : 'Verify Destination'}
                 </button>
               </div>
 
@@ -1565,6 +1900,28 @@ function App() {
               {uploadResultMessage && (
                 <div style={uploadResultMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
                   {uploadResultMessage.text}
+                </div>
+              )}
+
+              {resumeNotice && <div style={styles.successBanner}>{resumeNotice}</div>}
+
+              {executionPreflight && (
+                <div style={styles.mappingSummaryPanel}>
+                  <h4 style={styles.mappingSummaryTitle}>Resume-aware Preflight</h4>
+                  <div style={styles.mappingSummaryText}>
+                    already uploaded: {executionPreflight.alreadyUploadedCount} · pending: {executionPreflight.pendingUploadCount} ·
+                    missing/unreadable: {executionPreflight.missingUnreadableCount}
+                  </div>
+                  {executionPreflight.slotSummaries.map((slot) => (
+                    <div key={slot.slotId} style={styles.mappingSlotSummaryRow}>
+                      <span>
+                        {slot.slotLabel} · {slot.status}
+                      </span>
+                      <span>
+                        done {slot.alreadyUploaded} · pending {slot.pendingUpload} · blocked {slot.missingUnreadable}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               )}
 
@@ -1608,6 +1965,24 @@ function App() {
                   ))}
                 </div>
               </div>
+
+              {verificationSummary && (
+                <div style={styles.mappingSummaryPanel}>
+                  <h4 style={styles.mappingSummaryTitle}>Verification Summary</h4>
+                  <div style={styles.mappingSummaryText}>
+                    checked: {verificationSummary.checked} · valid: {verificationSummary.valid} · invalid:{' '}
+                    {verificationSummary.invalid}
+                  </div>
+                  {verificationSummary.details
+                    .filter((item) => !item.exists || !item.filenameMatches || !item.sizeMatches)
+                    .map((item) => (
+                      <div key={item.filePath} style={styles.mappingWarning}>
+                        {item.filePath} :: exists={String(item.exists)} filename={String(item.filenameMatches)} size=
+                        {String(item.sizeMatches)} {item.error ? `(${item.error})` : ''}
+                      </div>
+                    ))}
+                </div>
+              )}
             </>
           )}
 

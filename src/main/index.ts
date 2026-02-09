@@ -72,6 +72,22 @@ type DryRunFileResult = {
   currentSizeBytes: number | null
 }
 
+type VerifyDestinationRequestItem = {
+  filePath: string
+  expectedSizeBytes: number | null
+  expectedFilename: string | null
+}
+
+type VerifyDestinationResultItem = {
+  filePath: string
+  localPath: string
+  exists: boolean
+  filenameMatches: boolean
+  sizeMatches: boolean
+  actualSizeBytes: number | null
+  error: string | null
+}
+
 type ExecutionUploadItem = {
   projectId: string
   slotId: string
@@ -291,6 +307,15 @@ function probeReadStream(sourcePath: string): Promise<void> {
       reject(error)
     })
   })
+}
+
+function resolveDriveUriToLocalPath(filePath: string, driveRootPath: string): string {
+  if (!filePath.startsWith('drive://')) {
+    throw new Error(`Unsupported file path scheme: ${filePath}`)
+  }
+
+  const relativePath = filePath.replace(/^drive:\/\//, '')
+  return path.join(driveRootPath, relativePath)
 }
 
 class FilesystemStreamingAdapter {
@@ -724,6 +749,65 @@ app.whenReady().then(() => {
           message: getErrorMessage(error),
           expectedSizeBytes: item.expectedSizeBytes,
           currentSizeBytes: null
+        })
+      }
+    }
+
+    return {
+      success: true,
+      results
+    }
+  })
+
+  ipcMain.handle('verify-destination-paths', async (_event, items: VerifyDestinationRequestItem[]) => {
+    const config = readDriveRootConfig()
+    if (!config.driveRootPath) {
+      throw new Error('Drive root path is not configured. Set it in Settings first.')
+    }
+
+    const validation = validateDriveRootPath(config.driveRootPath)
+    if (!validation.valid || !validation.normalizedPath) {
+      throw new Error(validation.error ?? 'Drive root path is invalid.')
+    }
+
+    const driveRootPath = validation.normalizedPath
+    const results: VerifyDestinationResultItem[] = []
+
+    for (const item of items) {
+      try {
+        const localPath = resolveDriveUriToLocalPath(item.filePath, driveRootPath)
+        const stats = await fs.promises.stat(localPath)
+
+        const expectedFilename = item.expectedFilename ?? path.basename(item.filePath)
+        const filenameMatches = path.basename(localPath) === expectedFilename
+        const sizeMatches = item.expectedSizeBytes === null ? true : stats.size === item.expectedSizeBytes
+
+        results.push({
+          filePath: item.filePath,
+          localPath,
+          exists: true,
+          filenameMatches,
+          sizeMatches,
+          actualSizeBytes: stats.size,
+          error: null
+        })
+      } catch (error: unknown) {
+        const localPath = (() => {
+          try {
+            return resolveDriveUriToLocalPath(item.filePath, driveRootPath)
+          } catch {
+            return ''
+          }
+        })()
+
+        results.push({
+          filePath: item.filePath,
+          localPath,
+          exists: false,
+          filenameMatches: false,
+          sizeMatches: false,
+          actualSizeBytes: null,
+          error: getErrorMessage(error)
         })
       }
     }

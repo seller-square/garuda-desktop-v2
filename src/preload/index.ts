@@ -33,6 +33,12 @@ const api = {
     return electronAPI.ipcRenderer.invoke('dry-run-stream-open', items)
   },
 
+  verifyDestinationPaths: (
+    items: Array<{ filePath: string; expectedSizeBytes: number | null; expectedFilename: string | null }>
+  ) => {
+    return electronAPI.ipcRenderer.invoke('verify-destination-paths', items)
+  },
+
   executeFilesystemStreamPlan: (request: {
     accessToken: string
     items: Array<{
