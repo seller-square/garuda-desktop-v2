@@ -35,6 +35,33 @@ type IngestionPlan = {
   files: ScannedFile[]
 }
 
+type SlotMappingSummary = {
+  slotId: string
+  slotLabel: string
+  fileCount: number
+  totalBytes: number
+  typeCounts: {
+    image: number
+    video: number
+    other: number
+  }
+  plannedFiles: ScannedFile[]
+}
+
+type MappingValidation = {
+  fileTypeMismatches: string[]
+  emptySlots: string[]
+  duplicateHashes: Array<{ sha256: string; paths: string[] }>
+}
+
+type MappingPlan = {
+  mappedFolderCount: number
+  totalFolderCount: number
+  unmappedFolders: string[]
+  slotSummaries: SlotMappingSummary[]
+  validation: MappingValidation
+}
+
 type ScanResult =
   | { success: true; plan: IngestionPlan }
   | { success: false; error: string }
@@ -121,6 +148,15 @@ function normalizeSlotCode(rawLabel: string): string {
     .replace(/[^A-Z0-9_]/g, '')
 }
 
+function buildSlotNameFromFolderPath(folderRelativePath: string): string {
+  if (folderRelativePath === '/') {
+    return 'ROOT'
+  }
+
+  const parts = folderRelativePath.split('/').filter(Boolean)
+  return parts[parts.length - 1] ?? 'NEW_SLOT'
+}
+
 async function createSlotForProject(projectId: string, slotLabel: string): Promise<string | null> {
   const slotCode = normalizeSlotCode(slotLabel)
   if (!slotCode) {
@@ -174,6 +210,9 @@ function App() {
   const [driveRootLoading, setDriveRootLoading] = useState(false)
   const [driveRootSaving, setDriveRootSaving] = useState(false)
   const [driveRootMessage, setDriveRootMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
+  const [folderSlotAssignments, setFolderSlotAssignments] = useState<Record<string, string>>({})
+  const [mappingMessage, setMappingMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
+  const [creatingSlotForFolder, setCreatingSlotForFolder] = useState<string | null>(null)
 
   const selectedProject = useMemo(
     () => projects.find((project) => getId(project) === selectedProjectId) ?? null,
@@ -195,6 +234,129 @@ function App() {
       return code.includes(query) || brand.includes(query)
     })
   }, [projects, projectSearch])
+
+  const slotById = useMemo(() => {
+    const index = new Map<string, RowRecord>()
+    for (const slot of slots) {
+      index.set(getId(slot), slot)
+    }
+    return index
+  }, [slots])
+
+  const mappingPlan = useMemo<MappingPlan | null>(() => {
+    if (!scanResult || !scanResult.success) {
+      return null
+    }
+
+    const folderToFiles = new Map<string, ScannedFile[]>()
+    for (const file of scanResult.plan.files) {
+      const existing = folderToFiles.get(file.parentRelativePath)
+      if (existing) {
+        existing.push(file)
+      } else {
+        folderToFiles.set(file.parentRelativePath, [file])
+      }
+    }
+
+    const slotSummariesMap = new Map<string, SlotMappingSummary>()
+
+    for (const group of scanResult.plan.folderGroups) {
+      const slotId = folderSlotAssignments[group.relativePath]
+      if (!slotId) continue
+
+      const slot = slotById.get(slotId)
+      if (!slot) continue
+
+      const slotLabel = getSlotLabel(slot)
+      const filesForFolder = folderToFiles.get(group.relativePath) ?? []
+
+      const current = slotSummariesMap.get(slotId)
+      if (!current) {
+        slotSummariesMap.set(slotId, {
+          slotId,
+          slotLabel,
+          fileCount: filesForFolder.length,
+          totalBytes: filesForFolder.reduce((sum, file) => sum + file.size, 0),
+          typeCounts: {
+            image: filesForFolder.filter((file) => file.fileType === 'image').length,
+            video: filesForFolder.filter((file) => file.fileType === 'video').length,
+            other: filesForFolder.filter((file) => file.fileType === 'other').length
+          },
+          plannedFiles: [...filesForFolder]
+        })
+      } else {
+        current.fileCount += filesForFolder.length
+        current.totalBytes += filesForFolder.reduce((sum, file) => sum + file.size, 0)
+        current.typeCounts.image += filesForFolder.filter((file) => file.fileType === 'image').length
+        current.typeCounts.video += filesForFolder.filter((file) => file.fileType === 'video').length
+        current.typeCounts.other += filesForFolder.filter((file) => file.fileType === 'other').length
+        current.plannedFiles.push(...filesForFolder)
+      }
+    }
+
+    const slotSummaries = Array.from(slotSummariesMap.values()).sort((a, b) => a.slotLabel.localeCompare(b.slotLabel))
+    const mappedFolderCount = Object.keys(folderSlotAssignments).filter((folder) =>
+      scanResult.plan.folderGroups.some((group) => group.relativePath === folder)
+    ).length
+    const unmappedFolders = scanResult.plan.folderGroups
+      .map((group) => group.relativePath)
+      .filter((folder) => !folderSlotAssignments[folder])
+
+    const fileTypeMismatches = slotSummaries
+      .filter((summary) => {
+        const nonZeroTypeCount = [summary.typeCounts.image, summary.typeCounts.video, summary.typeCounts.other].filter(
+          (count) => count > 0
+        ).length
+        return nonZeroTypeCount > 1
+      })
+      .map((summary) => `Slot "${summary.slotLabel}" has mixed file types.`)
+
+    const referencedSlotIds = new Set<string>(Object.values(folderSlotAssignments))
+    if (selectedSlotId) {
+      referencedSlotIds.add(selectedSlotId)
+    }
+
+    const emptySlots: string[] = []
+    for (const slotId of referencedSlotIds) {
+      const summary = slotSummariesMap.get(slotId)
+      if (summary && summary.fileCount > 0) {
+        continue
+      }
+
+      const slot = slotById.get(slotId)
+      if (slot) {
+        emptySlots.push(getSlotLabel(slot))
+      }
+    }
+
+    const hashToPaths = new Map<string, string[]>()
+    for (const summary of slotSummaries) {
+      for (const file of summary.plannedFiles) {
+        const existing = hashToPaths.get(file.sha256)
+        if (existing) {
+          existing.push(file.relativePath)
+        } else {
+          hashToPaths.set(file.sha256, [file.relativePath])
+        }
+      }
+    }
+
+    const duplicateHashes = Array.from(hashToPaths.entries())
+      .filter(([, paths]) => paths.length > 1)
+      .map(([sha256, paths]) => ({ sha256, paths }))
+
+    return {
+      mappedFolderCount,
+      totalFolderCount: scanResult.plan.folderGroups.length,
+      unmappedFolders,
+      slotSummaries,
+      validation: {
+        fileTypeMismatches,
+        emptySlots,
+        duplicateHashes
+      }
+    }
+  }, [folderSlotAssignments, scanResult, slotById])
 
   const loadProjects = async (opts?: { keepSelection?: boolean }) => {
     setProjectsLoading(true)
@@ -349,6 +511,7 @@ function App() {
     if (!selectedProjectId) {
       setSlots([])
       setSelectedSlotId(null)
+      setFolderSlotAssignments({})
       return
     }
 
@@ -361,12 +524,16 @@ function App() {
     const path = await window.api.selectFolder()
     setFolderPath(path)
     setScanResult(null)
+    setFolderSlotAssignments({})
+    setMappingMessage(null)
   }
 
   const handleScan = async () => {
     if (!folderPath) return
     setScanning(true)
     setScanResult(null)
+    setFolderSlotAssignments({})
+    setMappingMessage(null)
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
     setScanning(false)
@@ -374,6 +541,62 @@ function App() {
 
   const handleCancelScan = async () => {
     await window.api.cancelScanFolder()
+  }
+
+  const handleAssignFolderToSlot = (folderRelativePath: string, slotId: string) => {
+    setFolderSlotAssignments((current) => {
+      if (!slotId) {
+        const next = { ...current }
+        delete next[folderRelativePath]
+        return next
+      }
+
+      return {
+        ...current,
+        [folderRelativePath]: slotId
+      }
+    })
+  }
+
+  const handleCreateSlotFromFolder = async (folderRelativePath: string) => {
+    if (!selectedProjectId) return
+
+    const slotLabel = buildSlotNameFromFolderPath(folderRelativePath)
+    setCreatingSlotForFolder(folderRelativePath)
+    setMappingMessage(null)
+    setSlotsError(null)
+
+    try {
+      const createdSlotId = await createSlotForProject(selectedProjectId, slotLabel)
+      if (!createdSlotId) {
+        setMappingMessage({
+          kind: 'error',
+          text: `Unable to create slot for folder "${folderRelativePath}".`
+        })
+        return
+      }
+
+      await loadSlots(selectedProjectId, { keepSelection: true })
+      setFolderSlotAssignments((current) => ({
+        ...current,
+        [folderRelativePath]: createdSlotId
+      }))
+      setMappingMessage({
+        kind: 'success',
+        text: `Created slot "${slotLabel}" and mapped folder "${folderRelativePath}".`
+      })
+    } catch (error: unknown) {
+      const maybeCode = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : null
+      const errorText =
+        maybeCode === '23505'
+          ? `Slot code for "${slotLabel}" already exists. Map this folder to an existing slot.`
+          : error instanceof Error
+            ? error.message
+            : 'Unable to create slot from folder'
+      setMappingMessage({ kind: 'error', text: errorText })
+    } finally {
+      setCreatingSlotForFolder(null)
+    }
   }
 
   const loadDriveRootConfig = async () => {
@@ -680,9 +903,110 @@ function App() {
 
           {activeTab === 'plan' && (
             <>
-              {/* TODO(Phase 4): Reserve sequence numbers and preview canonical rename mapping. */}
-              <h3 style={styles.todoHeading}>Plan (Phase 4)</h3>
-              <p style={styles.todoText}>Sequence reservation and rename preview will be implemented in the next ingestion phase.</p>
+              <h3 style={styles.todoHeading}>Folder to Slot Mapping</h3>
+              <p style={styles.todoText}>
+                Map scanned folders to project slots. This builds an in-memory mapping plan only. No files are moved or uploaded.
+              </p>
+
+              {!scanResult || !scanResult.success ? (
+                <div style={styles.mutedPanel}>Run a scan first to build folder groups.</div>
+              ) : (
+                <>
+                  <div style={styles.mappingGridHeader}>
+                    <span>Folder Group</span>
+                    <span>Files</span>
+                    <span>Assign Slot</span>
+                    <span>Create Slot</span>
+                  </div>
+
+                  <div style={styles.mappingGridBody}>
+                    {scanResult.plan.folderGroups.map((group) => (
+                      <div key={group.relativePath} style={styles.mappingGridRow}>
+                        <span style={styles.mappingFolderCell}>{group.relativePath}</span>
+                        <span style={styles.mappingFileCell}>
+                          {group.fileCount} · img {group.typeCounts.image} · vid {group.typeCounts.video} · other{' '}
+                          {group.typeCounts.other}
+                        </span>
+                        <select
+                          value={folderSlotAssignments[group.relativePath] ?? ''}
+                          onChange={(event) => handleAssignFolderToSlot(group.relativePath, event.target.value)}
+                          style={styles.mappingSelect}
+                        >
+                          <option value="">Unmapped</option>
+                          {slots.map((slot) => (
+                            <option key={getId(slot)} value={getId(slot)}>
+                              {getSlotLabel(slot)}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          onClick={() => handleCreateSlotFromFolder(group.relativePath)}
+                          disabled={!selectedProjectId || creatingSlotForFolder === group.relativePath}
+                          style={styles.mappingCreateButton}
+                        >
+                          {creatingSlotForFolder === group.relativePath ? 'Creating...' : 'From Folder'}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+
+                  {mappingMessage && (
+                    <div style={mappingMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
+                      {mappingMessage.text}
+                    </div>
+                  )}
+
+                  {mappingPlan && (
+                    <div style={styles.mappingSummaryPanel}>
+                      <h4 style={styles.mappingSummaryTitle}>Mapping Summary</h4>
+                      <div style={styles.mappingSummaryText}>
+                        Mapped folders: {mappingPlan.mappedFolderCount}/{mappingPlan.totalFolderCount}
+                      </div>
+                      <div style={styles.mappingSummaryText}>Slot plans: {mappingPlan.slotSummaries.length}</div>
+
+                      {mappingPlan.unmappedFolders.length > 0 && (
+                        <div style={styles.mappingWarning}>
+                          Unmapped folders ({mappingPlan.unmappedFolders.length}): {mappingPlan.unmappedFolders.join(', ')}
+                        </div>
+                      )}
+
+                      {mappingPlan.slotSummaries.map((summary) => (
+                        <div key={summary.slotId} style={styles.mappingSlotSummaryRow}>
+                          <span>{summary.slotLabel}</span>
+                          <span>
+                            {summary.fileCount} files · {formatBytes(summary.totalBytes)} · img {summary.typeCounts.image} ·
+                            vid {summary.typeCounts.video} · other {summary.typeCounts.other}
+                          </span>
+                        </div>
+                      ))}
+
+                      {(mappingPlan.validation.fileTypeMismatches.length > 0 ||
+                        mappingPlan.validation.emptySlots.length > 0 ||
+                        mappingPlan.validation.duplicateHashes.length > 0) && (
+                        <div style={styles.mappingValidationPanel}>
+                          {mappingPlan.validation.fileTypeMismatches.map((issue) => (
+                            <div key={issue} style={styles.mappingWarning}>
+                              {issue}
+                            </div>
+                          ))}
+
+                          {mappingPlan.validation.emptySlots.map((slotLabel) => (
+                            <div key={slotLabel} style={styles.mappingWarning}>
+                              Slot "{slotLabel}" has no planned files.
+                            </div>
+                          ))}
+
+                          {mappingPlan.validation.duplicateHashes.map((duplicate) => (
+                            <div key={duplicate.sha256} style={styles.mappingWarning}>
+                              Duplicate hash {duplicate.sha256.slice(0, 12)}... across: {duplicate.paths.join(', ')}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              )}
             </>
           )}
 
@@ -1074,6 +1398,105 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 16,
     borderRadius: 12,
     border: '1px solid #1e293b',
+  },
+  mutedPanel: {
+    marginTop: 16,
+    border: '1px solid #1e293b',
+    borderRadius: 8,
+    padding: 12,
+    color: '#94a3b8',
+    fontSize: 13
+  },
+  mappingGridHeader: {
+    marginTop: 16,
+    display: 'grid',
+    gridTemplateColumns: '2fr 1.3fr 1.4fr 120px',
+    gap: 10,
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: 600,
+    borderBottom: '1px solid #1e293b',
+    paddingBottom: 8
+  },
+  mappingGridBody: {
+    maxHeight: 320,
+    overflowY: 'auto',
+    display: 'grid',
+    gap: 8,
+    marginTop: 8
+  },
+  mappingGridRow: {
+    display: 'grid',
+    gridTemplateColumns: '2fr 1.3fr 1.4fr 120px',
+    gap: 10,
+    alignItems: 'center',
+    borderBottom: '1px solid #1e293b',
+    paddingBottom: 8
+  },
+  mappingFolderCell: {
+    fontSize: 13,
+    color: '#e2e8f0',
+    wordBreak: 'break-word'
+  },
+  mappingFileCell: {
+    fontSize: 12,
+    color: '#94a3b8'
+  },
+  mappingSelect: {
+    borderRadius: 8,
+    border: '1px solid #334155',
+    background: '#0f172a',
+    color: 'white',
+    fontSize: 12,
+    padding: '8px 10px'
+  },
+  mappingCreateButton: {
+    border: 'none',
+    borderRadius: 8,
+    background: '#2563eb',
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 600,
+    padding: '8px 10px',
+    cursor: 'pointer'
+  },
+  mappingSummaryPanel: {
+    marginTop: 16,
+    border: '1px solid #1e293b',
+    borderRadius: 10,
+    padding: 12,
+    background: '#0f172a'
+  },
+  mappingSummaryTitle: {
+    margin: 0,
+    marginBottom: 8,
+    fontSize: 15
+  },
+  mappingSummaryText: {
+    fontSize: 13,
+    color: '#94a3b8',
+    marginBottom: 6
+  },
+  mappingSlotSummaryRow: {
+    fontSize: 13,
+    display: 'flex',
+    justifyContent: 'space-between',
+    gap: 12,
+    borderBottom: '1px solid #1e293b',
+    padding: '6px 0'
+  },
+  mappingValidationPanel: {
+    marginTop: 10,
+    display: 'grid',
+    gap: 6
+  },
+  mappingWarning: {
+    fontSize: 12,
+    color: '#fca5a5',
+    background: 'rgba(239, 68, 68, 0.08)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
+    borderRadius: 6,
+    padding: '6px 8px'
   },
   fileRow: {
     fontSize: 13,
