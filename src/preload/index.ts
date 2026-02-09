@@ -11,6 +11,18 @@ const api = {
   // Scan a selected folder recursively
   scanFolder: (folderPath: string) => {
     return electronAPI.ipcRenderer.invoke('scan-folder', folderPath)
+  },
+
+  getDriveRootPath: () => {
+    return electronAPI.ipcRenderer.invoke('get-drive-root-path')
+  },
+
+  validateDriveRootPath: (candidatePath: string | null) => {
+    return electronAPI.ipcRenderer.invoke('validate-drive-root-path', candidatePath)
+  },
+
+  setDriveRootPath: (candidatePath: string | null) => {
+    return electronAPI.ipcRenderer.invoke('set-drive-root-path', candidatePath)
   }
 }
 

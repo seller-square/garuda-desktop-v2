@@ -87,46 +87,24 @@ function normalizeSlotCode(rawLabel: string): string {
 }
 
 async function createSlotForProject(projectId: string, slotLabel: string): Promise<string | null> {
-  const rpcAttempts: Array<{ fn: string; args: Record<string, string> }> = [
-    { fn: 'create_project_slot', args: { project_id: projectId, slot_name: slotLabel } },
-    { fn: 'create_project_slot', args: { p_project_id: projectId, p_slot_name: slotLabel } },
-    { fn: 'create_project_slot', args: { project_id: projectId, name: slotLabel } },
-    { fn: 'create_project_slot', args: { p_project_id: projectId, p_name: slotLabel } },
-    { fn: 'create_slot', args: { project_id: projectId, slot_name: slotLabel } },
-    { fn: 'create_slot', args: { p_project_id: projectId, p_slot_name: slotLabel } },
-  ]
-
-  for (const attempt of rpcAttempts) {
-    const { data, error } = await supabase.rpc(attempt.fn, attempt.args)
-    if (error) {
-      continue
-    }
-
-    if (data && typeof data === 'object' && !Array.isArray(data)) {
-      return getId(data as RowRecord) || null
-    }
-
-    if (Array.isArray(data) && data.length > 0 && typeof data[0] === 'object' && data[0] !== null) {
-      return getId(data[0] as RowRecord) || null
-    }
-
+  const slotCode = normalizeSlotCode(slotLabel)
+  if (!slotCode) {
     return null
   }
 
-  const insertAttempts: Array<Record<string, string>> = [
-    { project_id: projectId, slot_name: slotLabel },
-    { project_id: projectId, name: slotLabel },
-    { project_id: projectId, slot_code: normalizeSlotCode(slotLabel) },
-    { project_id: projectId, code: normalizeSlotCode(slotLabel), name: slotLabel },
-    { project_id: projectId, label: slotLabel },
-  ]
+  const { data, error } = await supabase.rpc('create_project_slot', {
+    p_project_id: projectId,
+    p_slot_name: slotLabel,
+    p_slot_code: slotCode,
+    p_description: null,
+  })
 
-  for (const payload of insertAttempts) {
-    const { data, error } = await supabase.from('project_slots').insert(payload).select('*').single()
+  if (error) {
+    throw error
+  }
 
-    if (!error) {
-      return data ? getId(data as RowRecord) || null : null
-    }
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    return getId(data as RowRecord) || null
   }
 
   return null
@@ -156,6 +134,11 @@ function App() {
   const [folderPath, setFolderPath] = useState<string | null>(null)
   const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   const [scanning, setScanning] = useState(false)
+  const [driveRootPath, setDriveRootPath] = useState<string | null>(null)
+  const [driveRootInput, setDriveRootInput] = useState('')
+  const [driveRootLoading, setDriveRootLoading] = useState(false)
+  const [driveRootSaving, setDriveRootSaving] = useState(false)
+  const [driveRootMessage, setDriveRootMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
 
   const selectedProject = useMemo(
     () => projects.find((project) => getId(project) === selectedProjectId) ?? null,
@@ -262,21 +245,31 @@ function App() {
     setCreatingSlot(true)
     setSlotsError(null)
 
-    const createdSlotId = await createSlotForProject(selectedProjectId, label)
+    try {
+      const createdSlotId = await createSlotForProject(selectedProjectId, label)
 
-    if (!createdSlotId) {
-      setSlotsError(
-        'Unable to create slot. Please share your Supabase create-slot RPC signature so this client can call it explicitly.'
-      )
+      if (!createdSlotId) {
+        setSlotsError('Slot creation failed. Provide a slot name with letters or numbers so a valid slot code can be generated.')
+        setCreatingSlot(false)
+        return
+      }
+
+      await loadSlots(selectedProjectId, { keepSelection: false })
+      setSelectedSlotId(createdSlotId)
+      setNewSlotLabel('')
+      setCreateSlotMode(false)
       setCreatingSlot(false)
-      return
+    } catch (error: unknown) {
+      const maybeCode = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : null
+      const errorText =
+        maybeCode === '23505'
+          ? 'Slot code already exists for this project. Use a different slot name/code.'
+          : error instanceof Error
+            ? error.message
+            : 'Unable to create slot'
+      setSlotsError(errorText)
+      setCreatingSlot(false)
     }
-
-    await loadSlots(selectedProjectId, { keepSelection: false })
-    setSelectedSlotId(createdSlotId)
-    setNewSlotLabel('')
-    setCreateSlotMode(false)
-    setCreatingSlot(false)
   }
 
   useEffect(() => {
@@ -299,6 +292,12 @@ function App() {
     if (!session) return
     loadProjects().catch((error: unknown) => {
       setProjectsError(error instanceof Error ? error.message : 'Unknown error while fetching projects')
+    })
+    loadDriveRootConfig().catch((error: unknown) => {
+      setDriveRootMessage({
+        kind: 'error',
+        text: error instanceof Error ? error.message : 'Unknown error while loading drive root',
+      })
     })
   }, [session])
 
@@ -326,6 +325,72 @@ function App() {
     const result = await window.api.scanFolder(folderPath)
     setScanResult(result)
     setScanning(false)
+  }
+
+  const loadDriveRootConfig = async () => {
+    setDriveRootLoading(true)
+    setDriveRootMessage(null)
+
+    try {
+      const config = await window.api.getDriveRootPath()
+      const savedPath = config.driveRootPath
+      setDriveRootPath(savedPath)
+      setDriveRootInput(savedPath ?? '')
+    } catch (error: unknown) {
+      const errorText = error instanceof Error ? error.message : 'Failed to load drive root path'
+      setDriveRootMessage({ kind: 'error', text: errorText })
+    } finally {
+      setDriveRootLoading(false)
+    }
+  }
+
+  const handlePickDriveRoot = async () => {
+    const selectedPath = await window.api.selectFolder()
+    if (!selectedPath) return
+
+    setDriveRootInput(selectedPath)
+    const validation = await window.api.validateDriveRootPath(selectedPath)
+
+    if (validation.valid && validation.normalizedPath) {
+      setDriveRootMessage({ kind: 'success', text: 'Path looks valid. Save to persist it.' })
+    } else {
+      setDriveRootMessage({ kind: 'error', text: validation.error ?? 'Invalid drive root path.' })
+    }
+  }
+
+  const handleValidateDriveRoot = async () => {
+    const validation = await window.api.validateDriveRootPath(driveRootInput || null)
+    if (validation.valid && validation.normalizedPath) {
+      setDriveRootMessage({ kind: 'success', text: `Valid path: ${validation.normalizedPath}` })
+      return
+    }
+
+    setDriveRootMessage({ kind: 'error', text: validation.error ?? 'Invalid drive root path.' })
+  }
+
+  const handleSaveDriveRoot = async () => {
+    setDriveRootSaving(true)
+    setDriveRootMessage(null)
+
+    try {
+      const result = await window.api.setDriveRootPath(driveRootInput || null)
+      if (!result.success) {
+        setDriveRootMessage({ kind: 'error', text: result.error ?? 'Failed to save drive root path.' })
+        return
+      }
+
+      setDriveRootPath(result.driveRootPath)
+      setDriveRootInput(result.driveRootPath ?? '')
+      setDriveRootMessage({
+        kind: 'success',
+        text: result.driveRootPath ? 'Drive root path saved.' : 'Drive root path cleared.',
+      })
+    } catch (error: unknown) {
+      const errorText = error instanceof Error ? error.message : 'Failed to save drive root path'
+      setDriveRootMessage({ kind: 'error', text: errorText })
+    } finally {
+      setDriveRootSaving(false)
+    }
   }
 
   if (loading) {
@@ -568,9 +633,44 @@ function App() {
 
           {activeTab === 'settings' && (
             <>
-              {/* TODO(Phase 2): Configure and validate local Drive root path. */}
-              <h3 style={styles.todoHeading}>Settings (Phase 2)</h3>
-              <p style={styles.todoText}>Drive root path setup will be implemented in the next phase.</p>
+              <h3 style={styles.todoHeading}>Drive Root Path</h3>
+              <p style={styles.todoText}>
+                Select your local Google Drive Stream root path. This is saved in local app config and validated before save.
+              </p>
+
+              <div style={styles.settingsBlock}>
+                <label style={styles.settingsLabel}>Saved Path</label>
+                <div style={styles.savedPathBox}>{driveRootPath ?? 'Not configured'}</div>
+              </div>
+
+              <div style={styles.settingsBlock}>
+                <label style={styles.settingsLabel}>Drive Root</label>
+                <div style={styles.settingsInputRow}>
+                  <input
+                    value={driveRootInput}
+                    onChange={(event) => setDriveRootInput(event.target.value)}
+                    placeholder="/Users/you/Library/CloudStorage/GoogleDrive-..."
+                    style={styles.settingsInput}
+                  />
+                  <button onClick={handlePickDriveRoot} style={styles.actionButtonSecondary}>
+                    <FolderOpen size={16} /> Browse
+                  </button>
+                </div>
+                <div style={styles.settingsButtonRow}>
+                  <button onClick={handleValidateDriveRoot} style={styles.actionButtonSecondary} disabled={driveRootLoading}>
+                    Validate
+                  </button>
+                  <button onClick={handleSaveDriveRoot} style={styles.actionButtonPrimary} disabled={driveRootSaving}>
+                    {driveRootSaving ? 'Saving...' : 'Save'}
+                  </button>
+                </div>
+              </div>
+
+              {driveRootMessage && (
+                <div style={driveRootMessage.kind === 'error' ? styles.errorBanner : styles.successBanner}>
+                  {driveRootMessage.text}
+                </div>
+              )}
             </>
           )}
         </section>
@@ -810,6 +910,15 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'grid',
     gap: 4,
   },
+  successBanner: {
+    background: 'rgba(16, 185, 129, 0.1)',
+    border: '1px solid rgba(16, 185, 129, 0.3)',
+    color: '#6ee7b7',
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 12,
+    fontSize: 13,
+  },
   tabBar: {
     display: 'flex',
     gap: 8,
@@ -909,6 +1018,44 @@ const styles: Record<string, React.CSSProperties> = {
     margin: 0,
     color: '#94a3b8',
     fontSize: 14,
+  },
+  settingsBlock: {
+    marginTop: 16,
+  },
+  settingsLabel: {
+    display: 'block',
+    fontSize: 12,
+    color: '#94a3b8',
+    marginBottom: 8,
+  },
+  savedPathBox: {
+    background: '#0f172a',
+    border: '1px solid #1e293b',
+    borderRadius: 8,
+    padding: '10px 12px',
+    fontSize: 13,
+    color: '#cbd5e1',
+    minHeight: 18,
+    wordBreak: 'break-all',
+  },
+  settingsInputRow: {
+    display: 'flex',
+    gap: 10,
+  },
+  settingsInput: {
+    flex: 1,
+    borderRadius: 8,
+    border: '1px solid #334155',
+    background: '#0f172a',
+    color: 'white',
+    fontSize: 13,
+    padding: '10px 12px',
+    outline: 'none',
+  },
+  settingsButtonRow: {
+    display: 'flex',
+    gap: 10,
+    marginTop: 10,
   },
 }
 
