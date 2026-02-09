@@ -204,6 +204,30 @@ const SLOT_SEQUENCE_KEYS = [
   'sequence_counter'
 ]
 
+const EMPTY_INGESTION_PLAN: IngestionPlan = {
+  rootFolder: '',
+  scannedAt: '',
+  totalFiles: 0,
+  totalBytes: 0,
+  folderGroups: [],
+  files: []
+}
+
+function normalizeIngestionPlan(plan: Partial<IngestionPlan> | undefined): IngestionPlan {
+  if (!plan) {
+    return EMPTY_INGESTION_PLAN
+  }
+
+  return {
+    rootFolder: typeof plan.rootFolder === 'string' ? plan.rootFolder : '',
+    scannedAt: typeof plan.scannedAt === 'string' ? plan.scannedAt : '',
+    totalFiles: typeof plan.totalFiles === 'number' ? plan.totalFiles : Array.isArray(plan.files) ? plan.files.length : 0,
+    totalBytes: typeof plan.totalBytes === 'number' ? plan.totalBytes : 0,
+    folderGroups: Array.isArray(plan.folderGroups) ? plan.folderGroups : [],
+    files: Array.isArray(plan.files) ? plan.files : []
+  }
+}
+
 function getId(row: RowRecord): string {
   const idValue = row.id
   return typeof idValue === 'string' || typeof idValue === 'number' ? String(idValue) : ''
@@ -363,7 +387,8 @@ function App() {
   const [activeTab, setActiveTab] = useState<DashboardTab>('scan')
 
   const [folderPath, setFolderPath] = useState<string | null>(null)
-  const [scanResult, setScanResult] = useState<ScanResult | null>(null)
+  const [scanResult, setScanResult] = useState<ScanResult>({ success: true, plan: EMPTY_INGESTION_PLAN })
+  const [scanHasRun, setScanHasRun] = useState(false)
   const [scanning, setScanning] = useState(false)
   const [driveRootPath, setDriveRootPath] = useState<string | null>(null)
   const [driveRootInput, setDriveRootInput] = useState('')
@@ -416,12 +441,13 @@ function App() {
   }, [slots])
 
   const mappingPlan = useMemo<MappingPlan | null>(() => {
-    if (!scanResult || !scanResult.success) {
+    if (!scanResult.success) {
       return null
     }
 
+    const safePlan = normalizeIngestionPlan(scanResult.plan)
     const folderToFiles = new Map<string, ScannedFile[]>()
-    for (const file of scanResult.plan.files) {
+    for (const file of safePlan.files) {
       const existing = folderToFiles.get(file.parentRelativePath)
       if (existing) {
         existing.push(file)
@@ -432,7 +458,7 @@ function App() {
 
     const slotSummariesMap = new Map<string, SlotMappingSummary>()
 
-    for (const group of scanResult.plan.folderGroups) {
+    for (const group of safePlan.folderGroups) {
       const slotId = folderSlotAssignments[group.relativePath]
       if (!slotId) continue
 
@@ -485,9 +511,9 @@ function App() {
       slotNamingConfigs.map((config) => [config.slotId, config] as const)
     )
     const mappedFolderCount = Object.keys(folderSlotAssignments).filter((folder) =>
-      scanResult.plan.folderGroups.some((group) => group.relativePath === folder)
+      safePlan.folderGroups.some((group) => group.relativePath === folder)
     ).length
-    const unmappedFolders = scanResult.plan.folderGroups
+    const unmappedFolders = safePlan.folderGroups
       .map((group) => group.relativePath)
       .filter((folder) => !folderSlotAssignments[folder])
 
@@ -610,7 +636,7 @@ function App() {
 
     return {
       mappedFolderCount,
-      totalFolderCount: scanResult.plan.folderGroups.length,
+      totalFolderCount: safePlan.folderGroups.length,
       unmappedFolders,
       slotSummaries,
       slotNamingConfigs,
@@ -882,7 +908,8 @@ function App() {
   const handleSelectFolder = async () => {
     const path = await window.api.selectFolder()
     setFolderPath(path)
-    setScanResult(null)
+    setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
+    setScanHasRun(false)
     setFolderSlotAssignments({})
     setSlotNamingOverrides({})
     setMappingMessage(null)
@@ -898,7 +925,8 @@ function App() {
   const handleScan = async () => {
     if (!folderPath) return
     setScanning(true)
-    setScanResult(null)
+    setScanResult({ success: true, plan: EMPTY_INGESTION_PLAN })
+    setScanHasRun(false)
     setFolderSlotAssignments({})
     setSlotNamingOverrides({})
     setMappingMessage(null)
@@ -910,7 +938,25 @@ function App() {
     setResumeNotice(null)
     setAutoPreflightDoneKey(null)
     const result = await window.api.scanFolder(folderPath)
-    setScanResult(result)
+    if (result && typeof result === 'object' && 'success' in result) {
+      if (result.success) {
+        setScanResult({
+          success: true,
+          plan: normalizeIngestionPlan(result.plan)
+        })
+      } else {
+        setScanResult({
+          success: false,
+          error: typeof result.error === 'string' ? result.error : 'Scan failed.'
+        })
+      }
+    } else {
+      setScanResult({
+        success: false,
+        error: 'Scan failed: invalid response.'
+      })
+    }
+    setScanHasRun(true)
     setScanning(false)
   }
 
@@ -1613,17 +1659,22 @@ function App() {
 
               {folderPath && <div style={styles.pathText}>Selected: {folderPath}</div>}
 
-              {scanResult && scanResult.success && (
+              {!scanHasRun && (
+                <div style={styles.mutedPanel}>No scan yet. Select a folder and run scan.</div>
+              )}
+
+              {scanHasRun && scanResult.success && (
                 <div style={styles.resultPanel}>
-                  <strong>{scanResult.plan.totalFiles} files found</strong>
+                  <strong>{normalizeIngestionPlan(scanResult.plan).totalFiles} files found</strong>
                   <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 6 }}>
-                    Root: {scanResult.plan.rootFolder}
+                    Root: {normalizeIngestionPlan(scanResult.plan).rootFolder}
                   </div>
                   <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4 }}>
-                    Total size: {formatBytes(scanResult.plan.totalBytes)} · Folders: {scanResult.plan.folderGroups.length}
+                    Total size: {formatBytes(normalizeIngestionPlan(scanResult.plan).totalBytes)} · Folders:{' '}
+                    {normalizeIngestionPlan(scanResult.plan).folderGroups.length}
                   </div>
                   <div style={{ marginTop: 12, maxHeight: 300, overflowY: 'auto' }}>
-                    {scanResult.plan.folderGroups.map((group) => (
+                    {normalizeIngestionPlan(scanResult.plan).folderGroups.map((group) => (
                       <div key={group.relativePath} style={styles.fileRow}>
                         <span>{group.relativePath}</span>
                         <span style={{ color: '#64748b' }}>
@@ -1636,7 +1687,7 @@ function App() {
                 </div>
               )}
 
-              {scanResult && !scanResult.success && <div style={{ color: '#ef4444' }}>Error: {scanResult.error}</div>}
+              {scanHasRun && !scanResult.success && <div style={{ color: '#ef4444' }}>Error: {scanResult.error}</div>}
             </>
           )}
 
@@ -1647,7 +1698,7 @@ function App() {
                 Map scanned folders to project slots. This builds an in-memory mapping plan only. No files are moved or uploaded.
               </p>
 
-              {!scanResult || !scanResult.success ? (
+              {!scanHasRun || !scanResult.success ? (
                 <div style={styles.mutedPanel}>Run a scan first to build folder groups.</div>
               ) : (
                 <>
@@ -1659,7 +1710,7 @@ function App() {
                   </div>
 
                   <div style={styles.mappingGridBody}>
-                    {scanResult.plan.folderGroups.map((group) => (
+                    {normalizeIngestionPlan(scanResult.plan).folderGroups.map((group) => (
                       <div key={group.relativePath} style={styles.mappingGridRow}>
                         <span style={styles.mappingFolderCell}>{group.relativePath}</span>
                         <span style={styles.mappingFileCell}>
