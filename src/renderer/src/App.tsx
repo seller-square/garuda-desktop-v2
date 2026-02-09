@@ -192,6 +192,41 @@ type ProjectListItem = {
 }
 
 type DashboardTab = 'scan' | 'plan' | 'execution' | 'settings'
+type BucketCode = 'IMG' | 'VID' | 'AUD' | 'MUS' | 'TRN' | 'BTS'
+type WizardStep = 1 | 2 | 3 | 4
+type SlotStructureMode = 'flat' | 'subfolders'
+type SlotSubfolderMode = 'auto' | 'custom'
+
+type BucketWizardConfig = {
+  structureMode: SlotStructureMode
+  subfolderMode: SlotSubfolderMode
+  autoPrefix: string
+  autoCount: number
+  includeUnsorted: boolean
+  customNames: string
+}
+
+type SlotCreateInsertPlanItem = {
+  bucket: BucketCode
+  slotCode: string
+  slotName: string
+}
+
+type SlotCreateAutoPlanItem = {
+  bucket: BucketCode
+  count: number
+}
+
+type SlotWizardReview = {
+  insertItems: SlotCreateInsertPlanItem[]
+  autoItems: SlotCreateAutoPlanItem[]
+  errors: string[]
+  previewByBucket: Array<{
+    bucket: BucketCode
+    insertItems: SlotCreateInsertPlanItem[]
+    autoCount: number
+  }>
+}
 
 const SLOT_LABEL_KEYS = ['slot_name', 'name', 'title', 'slot_code', 'code', 'label']
 const SLOT_CODE_KEYS = ['slot_code', 'code', 'slot_name', 'name']
@@ -203,6 +238,23 @@ const SLOT_SEQUENCE_KEYS = [
   'last_sequence_number',
   'sequence_counter'
 ]
+const BUCKETS: Array<{ code: BucketCode; label: string }> = [
+  { code: 'IMG', label: 'Images' },
+  { code: 'VID', label: 'Videos' },
+  { code: 'AUD', label: 'Audio' },
+  { code: 'MUS', label: 'Music' },
+  { code: 'TRN', label: 'Transcript' },
+  { code: 'BTS', label: 'Behind the Scenes' }
+]
+const BUCKET_LABEL_BY_CODE: Record<BucketCode, string> = {
+  IMG: 'Images',
+  VID: 'Videos',
+  AUD: 'Audio',
+  MUS: 'Music',
+  TRN: 'Transcript',
+  BTS: 'Behind the Scenes'
+}
+const SLOT_CODE_PATTERN = /^[A-Za-z0-9_]+$/
 
 const EMPTY_INGESTION_PLAN: IngestionPlan = {
   rootFolder: '',
@@ -295,6 +347,23 @@ function normalizeSlotCode(rawLabel: string): string {
     .replace(/[^A-Z0-9_]/g, '')
 }
 
+function sanitizeSlotToken(name: string): string {
+  return name
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^A-Z0-9_]/g, '')
+}
+
+function makeSlotCode(bucket: BucketCode, token?: string): string {
+  if (!token) {
+    return bucket
+  }
+
+  const cleanedToken = sanitizeSlotToken(token)
+  return cleanedToken ? `${bucket}_${cleanedToken}` : bucket
+}
+
 function sanitizeFilenameToken(token: string): string {
   return token
     .trim()
@@ -365,7 +434,92 @@ async function createSlotForProject(projectId: string, slotLabel: string): Promi
   return null
 }
 
+function formatSupabaseError(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const code = 'code' in error ? String(error.code) : null
+    const message = 'message' in error ? String(error.message) : 'Supabase error'
+    const details = 'details' in error && error.details ? String(error.details) : null
+    const hint = 'hint' in error && error.hint ? String(error.hint) : null
+
+    return [code ? `code=${code}` : null, message, details ? `details=${details}` : null, hint ? `hint=${hint}` : null]
+      .filter(Boolean)
+      .join(' | ')
+  }
+
+  if (error instanceof Error) {
+    return error.message
+  }
+
+  return String(error)
+}
+
+async function insertProjectSlotsBulk(
+  projectId: string,
+  insertItems: SlotCreateInsertPlanItem[]
+): Promise<RowRecord[]> {
+  if (insertItems.length === 0) {
+    return []
+  }
+
+  const rows = insertItems.map((item) => ({
+    project_id: projectId,
+    slot_code: item.slotCode,
+    slot_name: item.slotName
+  }))
+
+  const { data, error } = await supabase.from('project_slots').insert(rows).select('*')
+  if (error) {
+    throw error
+  }
+
+  return (data ?? []) as RowRecord[]
+}
+
+async function extendSlotSeries(
+  projectId: string,
+  bucketCode: BucketCode,
+  count: number
+): Promise<RowRecord[]> {
+  const { data, error } = await supabase.rpc('extend_slot_series', {
+    p_project_id: projectId,
+    p_bucket_code: bucketCode,
+    p_count: count
+  })
+
+  if (error) {
+    throw error
+  }
+
+  if (Array.isArray(data)) {
+    return data as RowRecord[]
+  }
+
+  if (data && typeof data === 'object') {
+    return [data as RowRecord]
+  }
+
+  return []
+}
+
 function App() {
+  const defaultBucketConfig = (): BucketWizardConfig => ({
+    structureMode: 'flat',
+    subfolderMode: 'auto',
+    autoPrefix: 'SKU',
+    autoCount: 1,
+    includeUnsorted: false,
+    customNames: ''
+  })
+
+  const emptyBucketSelection = (): Record<BucketCode, boolean> => ({
+    IMG: true,
+    VID: true,
+    AUD: true,
+    MUS: true,
+    TRN: true,
+    BTS: true
+  })
+
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
 
@@ -379,10 +533,18 @@ function App() {
   const [slotsLoading, setSlotsLoading] = useState(false)
   const [slotsError, setSlotsError] = useState<string | null>(null)
   const [selectedSlotId, setSelectedSlotId] = useState<string | null>(null)
-
-  const [createSlotMode, setCreateSlotMode] = useState(false)
-  const [newSlotLabel, setNewSlotLabel] = useState('')
-  const [creatingSlot, setCreatingSlot] = useState(false)
+  const [slotActionMessage, setSlotActionMessage] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
+  const [showSlotWizard, setShowSlotWizard] = useState(false)
+  const [slotWizardStep, setSlotWizardStep] = useState<WizardStep>(1)
+  const [bucketSelection, setBucketSelection] = useState<Record<BucketCode, boolean>>(emptyBucketSelection)
+  const [imgBucketConfig, setImgBucketConfig] = useState<BucketWizardConfig>(defaultBucketConfig)
+  const [vidBucketConfig, setVidBucketConfig] = useState<BucketWizardConfig>(defaultBucketConfig)
+  const [vidMirrorImages, setVidMirrorImages] = useState(false)
+  const [slotWizardLoading, setSlotWizardLoading] = useState(false)
+  const [showAddMoreSlotsDialog, setShowAddMoreSlotsDialog] = useState(false)
+  const [addMoreBucket, setAddMoreBucket] = useState<BucketCode>('IMG')
+  const [addMoreCount, setAddMoreCount] = useState(1)
+  const [addMoreLoading, setAddMoreLoading] = useState(false)
 
   const [activeTab, setActiveTab] = useState<DashboardTab>('scan')
 
@@ -439,6 +601,133 @@ function App() {
     }
     return index
   }, [slots])
+
+  const existingSlotCodes = useMemo(() => {
+    const codes = new Set<string>()
+    for (const slot of slots) {
+      const code = getSlotCode(slot)
+      if (code) {
+        codes.add(code)
+      }
+    }
+    return codes
+  }, [slots])
+
+  const slotWizardReview = useMemo<SlotWizardReview>(() => {
+    const selectedBuckets = (Object.entries(bucketSelection) as Array<[BucketCode, boolean]>)
+      .filter(([, checked]) => checked)
+      .map(([bucket]) => bucket)
+
+    const insertItems: SlotCreateInsertPlanItem[] = []
+    const autoItems: SlotCreateAutoPlanItem[] = []
+    const errors: string[] = []
+    const plannedCodes = new Set<string>()
+
+    const pushInsertItem = (bucket: BucketCode, slotCode: string, slotName: string) => {
+      if (!SLOT_CODE_PATTERN.test(slotCode)) {
+        errors.push(`Invalid slot code "${slotCode}". Allowed pattern is [A-Za-z0-9_]+.`)
+        return
+      }
+
+      if (plannedCodes.has(slotCode)) {
+        errors.push(`Duplicate planned slot code "${slotCode}".`)
+        return
+      }
+
+      if (existingSlotCodes.has(slotCode)) {
+        errors.push(`Slot code "${slotCode}" already exists in this project.`)
+        return
+      }
+
+      plannedCodes.add(slotCode)
+      insertItems.push({ bucket, slotCode, slotName })
+    }
+
+    for (const bucket of selectedBuckets) {
+      if (bucket !== 'IMG' && bucket !== 'VID') {
+        pushInsertItem(bucket, makeSlotCode(bucket), BUCKET_LABEL_BY_CODE[bucket])
+        continue
+      }
+
+      const config = bucket === 'IMG' ? imgBucketConfig : vidMirrorImages ? imgBucketConfig : vidBucketConfig
+      const shouldMirror = bucket === 'VID' && vidMirrorImages
+
+      if (config.structureMode === 'flat') {
+        pushInsertItem(bucket, makeSlotCode(bucket), BUCKET_LABEL_BY_CODE[bucket])
+        continue
+      }
+
+      if (config.subfolderMode === 'auto') {
+        const count = Math.max(1, Number(config.autoCount))
+        autoItems.push({ bucket, count })
+
+        if (config.includeUnsorted) {
+          pushInsertItem(bucket, makeSlotCode(bucket, 'UNSORTED'), `${BUCKET_LABEL_BY_CODE[bucket]} UNSORTED`)
+        }
+        continue
+      }
+
+      const names = config.customNames
+        .split(/[\n,]+/)
+        .map((name) => sanitizeSlotToken(name))
+        .filter(Boolean)
+
+      if (names.length === 0) {
+        errors.push(`${bucket} custom subfolders are empty.`)
+        continue
+      }
+
+      for (const token of names) {
+        const slotCode = makeSlotCode(bucket, token)
+        const slotName = `${BUCKET_LABEL_BY_CODE[bucket]} ${token}`
+        pushInsertItem(bucket, slotCode, slotName)
+      }
+
+      if (config.includeUnsorted) {
+        pushInsertItem(bucket, makeSlotCode(bucket, 'UNSORTED'), `${BUCKET_LABEL_BY_CODE[bucket]} UNSORTED`)
+      }
+
+      if (shouldMirror && bucket === 'VID') {
+        // no-op marker: VID uses IMG config in mirror mode.
+      }
+    }
+
+    if (selectedBuckets.length === 0) {
+      errors.push('Select at least one bucket.')
+    }
+
+    const previewByBucket = (BUCKETS.map((bucket) => {
+      const bucketInsertItems = insertItems.filter((item) => item.bucket === bucket.code)
+      const bucketAutoCount = autoItems
+        .filter((item) => item.bucket === bucket.code)
+        .reduce((sum, item) => sum + item.count, 0)
+      return {
+        bucket: bucket.code,
+        insertItems: bucketInsertItems,
+        autoCount: bucketAutoCount
+      }
+    }) as SlotWizardReview['previewByBucket']).filter((entry) => entry.insertItems.length > 0 || entry.autoCount > 0)
+
+    return {
+      insertItems,
+      autoItems,
+      errors,
+      previewByBucket
+    }
+  }, [bucketSelection, existingSlotCodes, imgBucketConfig, vidBucketConfig, vidMirrorImages])
+
+  const selectedWizardBuckets = useMemo(
+    () =>
+      (Object.entries(bucketSelection) as Array<[BucketCode, boolean]>)
+        .filter(([, selected]) => selected)
+        .map(([bucket]) => bucket),
+    [bucketSelection]
+  )
+
+  const slotWizardCreateCount = useMemo(
+    () => slotWizardReview.insertItems.length + slotWizardReview.autoItems.reduce((sum, item) => sum + item.count, 0),
+    [slotWizardReview]
+  )
 
   const mappingPlan = useMemo<MappingPlan | null>(() => {
     if (!scanResult.success) {
@@ -801,39 +1090,99 @@ function App() {
     setSelectedSlotId(getId(rows[0]))
   }
 
-  const handleCreateSlot = async () => {
+  const resetSlotWizard = () => {
+    setSlotWizardStep(1)
+    setBucketSelection(emptyBucketSelection())
+    setImgBucketConfig(defaultBucketConfig())
+    setVidBucketConfig(defaultBucketConfig())
+    setVidMirrorImages(false)
+    setSlotWizardLoading(false)
+  }
+
+  const openSlotWizard = () => {
+    resetSlotWizard()
+    setSlotActionMessage(null)
+    setShowSlotWizard(true)
+  }
+
+  const handleCreateSlotsFromWizard = async () => {
     if (!selectedProjectId) return
 
-    const label = newSlotLabel.trim()
-    if (!label) return
+    if (slotWizardReview.errors.length > 0) {
+      setSlotActionMessage({
+        kind: 'error',
+        text: slotWizardReview.errors.join(' ')
+      })
+      return
+    }
 
-    setCreatingSlot(true)
+    setSlotWizardLoading(true)
     setSlotsError(null)
+    setSlotActionMessage(null)
 
     try {
-      const createdSlotId = await createSlotForProject(selectedProjectId, label)
+      let createdRows: RowRecord[] = []
 
-      if (!createdSlotId) {
-        setSlotsError('Slot creation failed. Provide a slot name with letters or numbers so a valid slot code can be generated.')
-        setCreatingSlot(false)
-        return
+      if (slotWizardReview.insertItems.length > 0) {
+        const inserted = await insertProjectSlotsBulk(selectedProjectId, slotWizardReview.insertItems)
+        createdRows = createdRows.concat(inserted)
       }
 
-      await loadSlots(selectedProjectId, { keepSelection: false })
-      setSelectedSlotId(createdSlotId)
-      setNewSlotLabel('')
-      setCreateSlotMode(false)
-      setCreatingSlot(false)
+      for (const autoItem of slotWizardReview.autoItems) {
+        const extended = await extendSlotSeries(selectedProjectId, autoItem.bucket, autoItem.count)
+        createdRows = createdRows.concat(extended)
+      }
+
+      await loadSlots(selectedProjectId, { keepSelection: true })
+      const createdCount = slotWizardReview.insertItems.length + slotWizardReview.autoItems.reduce((sum, item) => sum + item.count, 0)
+      setSlotActionMessage({
+        kind: 'success',
+        text: `Created/extended ${createdCount} slot(s).`
+      })
+
+      if (createdRows.length > 0) {
+        setSelectedSlotId(getId(createdRows[0]))
+      }
+
+      setShowSlotWizard(false)
+      resetSlotWizard()
     } catch (error: unknown) {
-      const maybeCode = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : null
-      const errorText =
-        maybeCode === '23505'
-          ? 'Slot code already exists for this project. Use a different slot name/code.'
-          : error instanceof Error
-            ? error.message
-            : 'Unable to create slot'
-      setSlotsError(errorText)
-      setCreatingSlot(false)
+      const formattedError = formatSupabaseError(error)
+      setSlotsError(formattedError)
+      setSlotActionMessage({
+        kind: 'error',
+        text: `Unable to create slots. ${formattedError}`
+      })
+    } finally {
+      setSlotWizardLoading(false)
+    }
+  }
+
+  const handleAddMoreSlots = async () => {
+    if (!selectedProjectId) return
+
+    const count = Math.max(1, Number(addMoreCount))
+    setAddMoreLoading(true)
+    setSlotsError(null)
+    setSlotActionMessage(null)
+
+    try {
+      await extendSlotSeries(selectedProjectId, addMoreBucket, count)
+      await loadSlots(selectedProjectId, { keepSelection: true })
+      setSlotActionMessage({
+        kind: 'success',
+        text: `Added ${count} ${addMoreBucket} slot(s).`
+      })
+      setShowAddMoreSlotsDialog(false)
+    } catch (error: unknown) {
+      const formattedError = formatSupabaseError(error)
+      setSlotsError(formattedError)
+      setSlotActionMessage({
+        kind: 'error',
+        text: `Unable to add slots. ${formattedError}`
+      })
+    } finally {
+      setAddMoreLoading(false)
     }
   }
 
@@ -886,6 +1235,10 @@ function App() {
 
   useEffect(() => {
     if (!selectedProjectId) {
+      setShowSlotWizard(false)
+      setShowAddMoreSlotsDialog(false)
+      resetSlotWizard()
+      setSlotActionMessage(null)
       setSlots([])
       setSelectedSlotId(null)
       setFolderSlotAssignments({})
@@ -900,6 +1253,10 @@ function App() {
       return
     }
 
+    setShowSlotWizard(false)
+    setShowAddMoreSlotsDialog(false)
+    resetSlotWizard()
+    setSlotActionMessage(null)
     loadSlots(selectedProjectId).catch((error: unknown) => {
       setSlotsError(error instanceof Error ? error.message : 'Unknown error while fetching project slots')
     })
@@ -937,31 +1294,51 @@ function App() {
     setVerificationSummary(null)
     setResumeNotice(null)
     setAutoPreflightDoneKey(null)
-    const result = await window.api.scanFolder(folderPath)
-    if (result && typeof result === 'object' && 'success' in result) {
-      if (result.success) {
-        setScanResult({
-          success: true,
-          plan: normalizeIngestionPlan(result.plan)
-        })
+    try {
+      const result = await window.api.scanFolder(folderPath)
+      if (result && typeof result === 'object' && 'success' in result) {
+        if (result.success) {
+          setScanResult({
+            success: true,
+            plan: normalizeIngestionPlan(result.plan)
+          })
+        } else {
+          setScanResult({
+            success: false,
+            error: typeof result.error === 'string' ? result.error : 'Scan failed.'
+          })
+        }
       } else {
         setScanResult({
           success: false,
-          error: typeof result.error === 'string' ? result.error : 'Scan failed.'
+          error: 'Scan failed: invalid response.'
         })
       }
-    } else {
+      setScanHasRun(true)
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Scan failed.'
       setScanResult({
         success: false,
-        error: 'Scan failed: invalid response.'
+        error: message
       })
+      setScanHasRun(true)
+    } finally {
+      setScanning(false)
     }
-    setScanHasRun(true)
-    setScanning(false)
   }
 
   const handleCancelScan = async () => {
-    await window.api.cancelScanFolder()
+    try {
+      await window.api.cancelScanFolder()
+    } catch (error: unknown) {
+      setScanResult({
+        success: false,
+        error: error instanceof Error ? error.message : 'Failed to cancel scan.'
+      })
+      setScanHasRun(true)
+    } finally {
+      setScanning(false)
+    }
   }
 
   const handleAssignFolderToSlot = (folderRelativePath: string, slotId: string) => {
@@ -1514,34 +1891,439 @@ function App() {
 
           <div style={styles.sectionHeader}>
             <p style={styles.sidebarCaption}>Slots</p>
-            <button
-              onClick={() => {
-                setCreateSlotMode((prev) => !prev)
-                setNewSlotLabel('')
-              }}
-              disabled={!selectedProjectId || creatingSlot}
-              style={styles.iconButton}
-              title="Create slot"
-            >
-              <Plus size={14} />
-            </button>
+            {selectedProjectId && (
+              <div style={styles.slotActionButtons}>
+                {slots.length > 0 && (
+                  <button
+                    onClick={() => {
+                      setSlotActionMessage(null)
+                      setShowAddMoreSlotsDialog((current) => !current)
+                      setShowSlotWizard(false)
+                    }}
+                    disabled={addMoreLoading || slotWizardLoading}
+                    style={styles.iconButtonWide}
+                    title="Add more slots"
+                  >
+                    Add More
+                  </button>
+                )}
+                <button
+                  onClick={openSlotWizard}
+                  disabled={slotWizardLoading || addMoreLoading}
+                  style={styles.iconButtonWide}
+                  title={slots.length === 0 ? 'Set up slots' : 'Open full slot wizard'}
+                >
+                  <Plus size={12} /> {slots.length === 0 ? 'Set Up' : 'Wizard'}
+                </button>
+              </div>
+            )}
           </div>
 
-          {createSlotMode && selectedProjectId && (
-            <div style={styles.inlineCreatePanel}>
+          {slotActionMessage && (
+            <div style={slotActionMessage.kind === 'error' ? styles.errorBannerCompact : styles.successBannerCompact}>
+              {slotActionMessage.text}
+            </div>
+          )}
+
+          {selectedProjectId && !slotsLoading && slots.length === 0 && !showSlotWizard && (
+            <div style={styles.slotSetupEmptyState}>
+              <div style={styles.slotSetupTitle}>Set up ingestion slots</div>
+              <div style={styles.slotSetupText}>
+                Create media buckets (IMG, VID, AUD, MUS, TRN, BTS) before mapping folders.
+              </div>
+              <button onClick={openSlotWizard} style={styles.createButton}>
+                <Plus size={14} /> Set Up Slots
+              </button>
+            </div>
+          )}
+
+          {selectedProjectId && showAddMoreSlotsDialog && slots.length > 0 && (
+            <div style={styles.slotDialogPanel}>
+              <div style={styles.slotDialogTitle}>Add More Slots</div>
+              <div style={styles.slotDialogText}>Extend an existing bucket series using `extend_slot_series`.</div>
+
+              <label style={styles.settingsLabel}>Bucket</label>
+              <select
+                value={addMoreBucket}
+                onChange={(event) => setAddMoreBucket(event.target.value as BucketCode)}
+                style={styles.mappingSelect}
+              >
+                {BUCKETS.map((bucket) => (
+                  <option key={bucket.code} value={bucket.code}>
+                    {bucket.code} · {bucket.label}
+                  </option>
+                ))}
+              </select>
+
+              <label style={styles.settingsLabel}>Count</label>
               <input
-                value={newSlotLabel}
-                onChange={(event) => setNewSlotLabel(event.target.value)}
-                placeholder="Slot label"
+                type="number"
+                min={1}
+                value={addMoreCount}
+                onChange={(event) => setAddMoreCount(Math.max(1, Number.parseInt(event.target.value, 10) || 1))}
                 style={styles.createInput}
               />
-              <button
-                onClick={handleCreateSlot}
-                disabled={creatingSlot || newSlotLabel.trim().length === 0}
-                style={styles.createButton}
-              >
-                {creatingSlot ? 'Creating...' : 'Create'}
-              </button>
+
+              <div style={styles.slotDialogActions}>
+                <button
+                  onClick={() => setShowAddMoreSlotsDialog(false)}
+                  disabled={addMoreLoading}
+                  style={styles.actionButtonSecondary}
+                >
+                  Close
+                </button>
+                <button onClick={handleAddMoreSlots} disabled={addMoreLoading} style={styles.actionButtonPrimary}>
+                  {addMoreLoading ? 'Adding...' : `Add ${Math.max(1, addMoreCount)} Slot(s)`}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {selectedProjectId && showSlotWizard && (
+            <div style={styles.slotDialogPanel}>
+              <div style={styles.slotDialogTitle}>Create Media Buckets</div>
+              <div style={styles.slotDialogText}>
+                Step {slotWizardStep} of 4. Build slot codes with deterministic rules before ingestion.
+              </div>
+
+              {slotWizardStep === 1 && (
+                <div style={styles.wizardSection}>
+                  <div style={styles.slotSetupTitle}>Set up ingestion slots</div>
+                  <div style={styles.slotSetupText}>
+                    This wizard matches Garuda Web behavior: flat/custom inserts plus `extend_slot_series` for auto slot
+                    series.
+                  </div>
+                </div>
+              )}
+
+              {slotWizardStep === 2 && (
+                <div style={styles.wizardSection}>
+                  <div style={styles.wizardSectionTitle}>Select Buckets</div>
+                  <div style={styles.bucketGrid}>
+                    {BUCKETS.map((bucket) => (
+                      <label key={bucket.code} style={styles.bucketOption}>
+                        <input
+                          type="checkbox"
+                          checked={bucketSelection[bucket.code]}
+                          onChange={(event) =>
+                            setBucketSelection((current) => ({
+                              ...current,
+                              [bucket.code]: event.target.checked
+                            }))
+                          }
+                        />
+                        <span>{bucket.code}</span>
+                        <span style={styles.projectSub}>{bucket.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {slotWizardStep === 3 && (
+                <div style={styles.wizardSection}>
+                  {selectedWizardBuckets.includes('IMG') && (
+                    <div style={styles.wizardBucketPanel}>
+                      <div style={styles.wizardSectionTitle}>IMG configuration</div>
+                      <label style={styles.settingsLabel}>Structure</label>
+                      <select
+                        value={imgBucketConfig.structureMode}
+                        onChange={(event) =>
+                          setImgBucketConfig((current) => ({
+                            ...current,
+                            structureMode: event.target.value as SlotStructureMode
+                          }))
+                        }
+                        style={styles.mappingSelect}
+                      >
+                        <option value="flat">Flat (single IMG slot)</option>
+                        <option value="subfolders">With subfolders</option>
+                      </select>
+
+                      {imgBucketConfig.structureMode === 'subfolders' && (
+                        <>
+                          <label style={styles.settingsLabel}>Subfolder mode</label>
+                          <select
+                            value={imgBucketConfig.subfolderMode}
+                            onChange={(event) =>
+                              setImgBucketConfig((current) => ({
+                                ...current,
+                                subfolderMode: event.target.value as SlotSubfolderMode
+                              }))
+                            }
+                            style={styles.mappingSelect}
+                          >
+                            <option value="auto">Auto-generate series</option>
+                            <option value="custom">Custom names</option>
+                          </select>
+
+                          {imgBucketConfig.subfolderMode === 'auto' ? (
+                            <>
+                              <label style={styles.settingsLabel}>Prefix label</label>
+                              <input
+                                value={imgBucketConfig.autoPrefix}
+                                onChange={(event) =>
+                                  setImgBucketConfig((current) => ({
+                                    ...current,
+                                    autoPrefix: event.target.value
+                                  }))
+                                }
+                                placeholder="SKU"
+                                style={styles.createInput}
+                              />
+                              <label style={styles.settingsLabel}>Count</label>
+                              <input
+                                type="number"
+                                min={1}
+                                value={imgBucketConfig.autoCount}
+                                onChange={(event) =>
+                                  setImgBucketConfig((current) => ({
+                                    ...current,
+                                    autoCount: Math.max(1, Number.parseInt(event.target.value, 10) || 1)
+                                  }))
+                                }
+                                style={styles.createInput}
+                              />
+                            </>
+                          ) : (
+                            <>
+                              <label style={styles.settingsLabel}>Custom names (comma/newline)</label>
+                              <textarea
+                                value={imgBucketConfig.customNames}
+                                onChange={(event) =>
+                                  setImgBucketConfig((current) => ({
+                                    ...current,
+                                    customNames: event.target.value
+                                  }))
+                                }
+                                placeholder="SKU01, SKU02"
+                                style={styles.wizardTextarea}
+                              />
+                            </>
+                          )}
+
+                          <label style={styles.checkboxRow}>
+                            <input
+                              type="checkbox"
+                              checked={imgBucketConfig.includeUnsorted}
+                              onChange={(event) =>
+                                setImgBucketConfig((current) => ({
+                                  ...current,
+                                  includeUnsorted: event.target.checked
+                                }))
+                              }
+                            />
+                            <span>Create IMG_UNSORTED</span>
+                          </label>
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {selectedWizardBuckets.includes('VID') && (
+                    <div style={styles.wizardBucketPanel}>
+                      <div style={styles.wizardSectionTitle}>VID configuration</div>
+                      <label style={styles.checkboxRow}>
+                        <input
+                          type="checkbox"
+                          checked={vidMirrorImages}
+                          onChange={(event) => setVidMirrorImages(event.target.checked)}
+                          disabled={!selectedWizardBuckets.includes('IMG')}
+                        />
+                        <span>Mirror Images configuration</span>
+                      </label>
+
+                      {!vidMirrorImages && (
+                        <>
+                          <label style={styles.settingsLabel}>Structure</label>
+                          <select
+                            value={vidBucketConfig.structureMode}
+                            onChange={(event) =>
+                              setVidBucketConfig((current) => ({
+                                ...current,
+                                structureMode: event.target.value as SlotStructureMode
+                              }))
+                            }
+                            style={styles.mappingSelect}
+                          >
+                            <option value="flat">Flat (single VID slot)</option>
+                            <option value="subfolders">With subfolders</option>
+                          </select>
+
+                          {vidBucketConfig.structureMode === 'subfolders' && (
+                            <>
+                              <label style={styles.settingsLabel}>Subfolder mode</label>
+                              <select
+                                value={vidBucketConfig.subfolderMode}
+                                onChange={(event) =>
+                                  setVidBucketConfig((current) => ({
+                                    ...current,
+                                    subfolderMode: event.target.value as SlotSubfolderMode
+                                  }))
+                                }
+                                style={styles.mappingSelect}
+                              >
+                                <option value="auto">Auto-generate series</option>
+                                <option value="custom">Custom names</option>
+                              </select>
+
+                              {vidBucketConfig.subfolderMode === 'auto' ? (
+                                <>
+                                  <label style={styles.settingsLabel}>Prefix label</label>
+                                  <input
+                                    value={vidBucketConfig.autoPrefix}
+                                    onChange={(event) =>
+                                      setVidBucketConfig((current) => ({
+                                        ...current,
+                                        autoPrefix: event.target.value
+                                      }))
+                                    }
+                                    placeholder="SKU"
+                                    style={styles.createInput}
+                                  />
+                                  <label style={styles.settingsLabel}>Count</label>
+                                  <input
+                                    type="number"
+                                    min={1}
+                                    value={vidBucketConfig.autoCount}
+                                    onChange={(event) =>
+                                      setVidBucketConfig((current) => ({
+                                        ...current,
+                                        autoCount: Math.max(1, Number.parseInt(event.target.value, 10) || 1)
+                                      }))
+                                    }
+                                    style={styles.createInput}
+                                  />
+                                </>
+                              ) : (
+                                <>
+                                  <label style={styles.settingsLabel}>Custom names (comma/newline)</label>
+                                  <textarea
+                                    value={vidBucketConfig.customNames}
+                                    onChange={(event) =>
+                                      setVidBucketConfig((current) => ({
+                                        ...current,
+                                        customNames: event.target.value
+                                      }))
+                                    }
+                                    placeholder="SKU01, SKU02"
+                                    style={styles.wizardTextarea}
+                                  />
+                                </>
+                              )}
+
+                              <label style={styles.checkboxRow}>
+                                <input
+                                  type="checkbox"
+                                  checked={vidBucketConfig.includeUnsorted}
+                                  onChange={(event) =>
+                                    setVidBucketConfig((current) => ({
+                                      ...current,
+                                      includeUnsorted: event.target.checked
+                                    }))
+                                  }
+                                />
+                                <span>Create VID_UNSORTED</span>
+                              </label>
+                            </>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {selectedWizardBuckets.filter((bucket) => bucket !== 'IMG' && bucket !== 'VID').length > 0 && (
+                    <div style={styles.wizardBucketPanel}>
+                      <div style={styles.wizardSectionTitle}>Flat buckets</div>
+                      <div style={styles.slotDialogText}>
+                        {selectedWizardBuckets
+                          .filter((bucket) => bucket !== 'IMG' && bucket !== 'VID')
+                          .map((bucket) => `${bucket} (${BUCKET_LABEL_BY_CODE[bucket]})`)
+                          .join(', ')}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {slotWizardStep === 4 && (
+                <div style={styles.wizardSection}>
+                  <div style={styles.wizardSectionTitle}>Review</div>
+                  {slotWizardReview.previewByBucket.map((entry) => (
+                    <div key={entry.bucket} style={styles.wizardBucketPanel}>
+                      <div style={styles.projectTitle}>
+                        {entry.bucket} · {BUCKET_LABEL_BY_CODE[entry.bucket]}
+                      </div>
+                      {entry.autoCount > 0 && (
+                        <div style={styles.projectSub}>
+                          Auto series: +{entry.autoCount} via `extend_slot_series`
+                        </div>
+                      )}
+                      {entry.insertItems.map((item) => (
+                        <div key={item.slotCode} style={styles.projectSub}>
+                          Insert: {item.slotCode} ({item.slotName})
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+
+                  {slotWizardReview.errors.length > 0 && (
+                    <div style={styles.errorBannerCompact}>
+                      {slotWizardReview.errors.map((error) => (
+                        <div key={error}>{error}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div style={styles.slotDialogActions}>
+                <button
+                  onClick={() => {
+                    setShowSlotWizard(false)
+                    resetSlotWizard()
+                  }}
+                  disabled={slotWizardLoading}
+                  style={styles.actionButtonSecondary}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => setSlotWizardStep((current) => Math.max(1, current - 1) as WizardStep)}
+                  disabled={slotWizardLoading || slotWizardStep === 1}
+                  style={styles.actionButtonSecondary}
+                >
+                  Back
+                </button>
+                {slotWizardStep < 4 ? (
+                  <button
+                    onClick={() => {
+                      if (slotWizardStep === 2 && selectedWizardBuckets.length === 0) {
+                        setSlotActionMessage({ kind: 'error', text: 'Select at least one bucket.' })
+                        return
+                      }
+                      setSlotActionMessage(null)
+                      setSlotWizardStep((current) => Math.min(4, current + 1) as WizardStep)
+                    }}
+                    disabled={slotWizardLoading}
+                    style={styles.actionButtonPrimary}
+                  >
+                    Next
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleCreateSlotsFromWizard}
+                    disabled={slotWizardLoading || slotWizardCreateCount === 0 || slotWizardReview.errors.length > 0}
+                    style={
+                      slotWizardLoading || slotWizardCreateCount === 0 || slotWizardReview.errors.length > 0
+                        ? styles.actionButtonDisabled
+                        : styles.actionButtonPrimary
+                    }
+                  >
+                    {slotWizardLoading ? 'Creating...' : `Create ${slotWizardCreateCount} Slots`}
+                  </button>
+                )}
+              </div>
             </div>
           )}
 
@@ -1557,6 +2339,8 @@ function App() {
                 const id = getId(slot)
                 const selected = id === selectedSlotId
                 const sequence = getSlotSequence(slot)
+                const slotCode = getSlotCode(slot)
+                const slotLabel = getSlotLabel(slot)
 
                 return (
                   <button
@@ -1564,9 +2348,10 @@ function App() {
                     style={selected ? styles.slotRowSelected : styles.slotRow}
                     onClick={() => setSelectedSlotId(id)}
                   >
-                    <span style={styles.projectTitle}>{getSlotLabel(slot)}</span>
+                    <span style={styles.projectTitle}>{slotCode}</span>
                     <span style={styles.projectSub}>
-                      {sequence !== null ? `Current sequence: ${sequence}` : 'Sequence unavailable'}
+                      {slotLabel}
+                      {sequence !== null ? ` · Current sequence: ${sequence}` : ''}
                     </span>
                   </button>
                 )
@@ -2229,6 +3014,11 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  slotActionButtons: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 6,
+  },
   iconButton: {
     border: '1px solid #1e293b',
     background: '#0f172a',
@@ -2241,6 +3031,21 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: 'center',
     cursor: 'pointer',
     padding: 0,
+  },
+  iconButtonWide: {
+    border: '1px solid #1e293b',
+    background: '#0f172a',
+    color: '#e2e8f0',
+    borderRadius: 8,
+    minHeight: 24,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    cursor: 'pointer',
+    padding: '4px 8px',
+    fontSize: 11,
+    gap: 4,
+    whiteSpace: 'nowrap',
   },
   inlineCreatePanel: {
     display: 'flex',
@@ -2258,6 +3063,9 @@ const styles: Record<string, React.CSSProperties> = {
     outline: 'none',
   },
   createButton: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
     border: 'none',
     borderRadius: 8,
     background: '#2563eb',
@@ -2266,6 +3074,102 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 600,
     padding: '8px 10px',
     cursor: 'pointer',
+  },
+  slotSetupEmptyState: {
+    border: '1px solid #1e293b',
+    borderRadius: 8,
+    background: '#0f172a',
+    padding: 10,
+    marginBottom: 12,
+    display: 'grid',
+    gap: 8,
+  },
+  slotSetupTitle: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: '#e2e8f0',
+  },
+  slotSetupText: {
+    fontSize: 12,
+    color: '#94a3b8',
+    lineHeight: 1.4,
+  },
+  slotDialogPanel: {
+    border: '1px solid #334155',
+    borderRadius: 10,
+    background: '#0f172a',
+    padding: 10,
+    marginBottom: 12,
+    display: 'grid',
+    gap: 8,
+  },
+  slotDialogTitle: {
+    margin: 0,
+    fontSize: 14,
+    fontWeight: 700,
+    color: '#e2e8f0',
+  },
+  slotDialogText: {
+    fontSize: 12,
+    color: '#94a3b8',
+    lineHeight: 1.4,
+  },
+  slotDialogActions: {
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: 8,
+    marginTop: 4,
+  },
+  wizardSection: {
+    display: 'grid',
+    gap: 8,
+  },
+  wizardSectionTitle: {
+    fontSize: 13,
+    fontWeight: 600,
+    color: '#cbd5e1',
+  },
+  bucketGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+    gap: 8,
+  },
+  bucketOption: {
+    border: '1px solid #1e293b',
+    background: '#020617',
+    borderRadius: 8,
+    padding: 8,
+    display: 'grid',
+    gap: 4,
+    fontSize: 12,
+    color: '#e2e8f0',
+  },
+  wizardBucketPanel: {
+    border: '1px solid #1e293b',
+    borderRadius: 8,
+    background: '#020617',
+    padding: 8,
+    display: 'grid',
+    gap: 6,
+  },
+  wizardTextarea: {
+    width: '100%',
+    minHeight: 64,
+    borderRadius: 8,
+    border: '1px solid #334155',
+    background: '#020617',
+    color: 'white',
+    fontSize: 12,
+    padding: '8px 10px',
+    boxSizing: 'border-box',
+    resize: 'vertical',
+  },
+  checkboxRow: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 8,
+    fontSize: 12,
+    color: '#cbd5e1',
   },
   footer: {
     borderTop: '1px solid #1e293b',
@@ -2324,6 +3228,26 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 12,
     marginTop: 12,
     fontSize: 13,
+  },
+  errorBannerCompact: {
+    background: 'rgba(239, 68, 68, 0.1)',
+    border: '1px solid rgba(239, 68, 68, 0.25)',
+    color: '#fecaca',
+    borderRadius: 8,
+    padding: 8,
+    marginBottom: 10,
+    fontSize: 12,
+    display: 'grid',
+    gap: 4,
+  },
+  successBannerCompact: {
+    background: 'rgba(16, 185, 129, 0.1)',
+    border: '1px solid rgba(16, 185, 129, 0.3)',
+    color: '#6ee7b7',
+    borderRadius: 8,
+    padding: 8,
+    marginBottom: 10,
+    fontSize: 12,
   },
   tabBar: {
     display: 'flex',
